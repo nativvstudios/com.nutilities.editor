@@ -219,7 +219,7 @@ namespace nUtils.HierarchyOrganizer
             EditorGUILayout.EndVertical();
 
             // Action buttons
-            EditorGUILayout.BeginVertical(GUILayout.Width(100));
+            EditorGUILayout.BeginVertical(GUILayout.Width(60));
 
             if (GUILayout.Button("Select", EditorStyles.miniButton))
             {
@@ -235,6 +235,14 @@ namespace nUtils.HierarchyOrganizer
 
             EditorGUILayout.EndVertical();
 
+            // Delete button
+            GUI.backgroundColor = new Color(0.9f, 0.4f, 0.4f);
+            if (GUILayout.Button("X", EditorStyles.miniButton, GUILayout.Width(22), GUILayout.Height(38)))
+            {
+                ShowDeleteOptionsDialog(separator);
+            }
+            GUI.backgroundColor = Color.white;
+
             // Context menu
             if (Event.current.type == EventType.ContextClick)
             {
@@ -247,6 +255,29 @@ namespace nUtils.HierarchyOrganizer
             }
 
             EditorGUILayout.EndHorizontal();
+        }
+
+        private void ShowDeleteOptionsDialog(HierarchySeparator separator)
+        {
+            int choice = EditorUtility.DisplayDialogComplex("Delete Separator",
+                $"What would you like to do with '{separator.gameObject.name}'?",
+                "Delete GameObject",
+                "Cancel",
+                "Remove Component Only");
+
+            switch (choice)
+            {
+                case 0: // Delete GameObject
+                    Undo.DestroyObjectImmediate(separator.gameObject);
+                    RefreshSeparatorsList();
+                    break;
+                case 1: // Cancel
+                    break;
+                case 2: // Remove Component Only
+                    Undo.DestroyObjectImmediate(separator);
+                    RefreshSeparatorsList();
+                    break;
+            }
         }
 
         private void ShowSeparatorContextMenu(HierarchySeparator separator)
@@ -299,13 +330,7 @@ namespace nUtils.HierarchyOrganizer
 
             menu.AddItem(new GUIContent("Delete"), false, () =>
             {
-                if (EditorUtility.DisplayDialog("Delete Separator",
-                    $"Are you sure you want to delete '{separator.gameObject.name}'?",
-                    "Delete", "Cancel"))
-                {
-                    Undo.DestroyObjectImmediate(separator.gameObject);
-                    RefreshSeparatorsList();
-                }
+                ShowDeleteOptionsDialog(separator);
             });
 
             menu.ShowAsContext();

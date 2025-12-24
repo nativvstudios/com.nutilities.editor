@@ -22,16 +22,57 @@ namespace nUtils.HierarchyOrganizer
 
             HierarchySeparator separator = obj.GetComponent<HierarchySeparator>();
 
-            if (separator == null)
+            if (Event.current.type != EventType.Repaint)
                 return;
 
-            // Draw colored background across entire row
-            Rect bgRect = selectionRect;
-            bgRect.xMin = 32; // Start after the fold arrow
-            bgRect.xMax = selectionRect.xMax + 16; // Extend to the right edge
+            // Check if this object is a child of a separator (and not a separator itself)
+            if (separator == null)
+            {
+                DrawChildOutlineIfUnderSeparator(obj, selectionRect);
+                return;
+            }
 
             Color backgroundColor = separator.GetColor();
-            EditorGUI.DrawRect(bgRect, backgroundColor);
+            bool hasChildren = obj.transform.childCount > 0;
+
+            // Calculate the full width of the hierarchy window
+            float fullWidth = selectionRect.x + selectionRect.width + 16;
+
+            // Foldout area position
+            float foldoutStart = selectionRect.x - 14;
+            float foldoutWidth = 14;
+
+            if (hasChildren)
+            {
+                // Draw background in three parts: left of foldout, semi-transparent foldout area, right of foldout
+
+                // Left portion: from edge to foldout
+                Rect leftRect = new Rect(0, selectionRect.y, foldoutStart, selectionRect.height);
+                EditorGUI.DrawRect(leftRect, backgroundColor);
+
+                // Foldout area: semi-transparent so Unity's animated arrow shows through
+                Rect foldoutRect = new Rect(foldoutStart, selectionRect.y, foldoutWidth, selectionRect.height);
+                Color foldoutColor = new Color(backgroundColor.r, backgroundColor.g, backgroundColor.b, 0.4f);
+                EditorGUI.DrawRect(foldoutRect, foldoutColor);
+
+                // Right portion: from after foldout to end
+                Rect rightRect = new Rect(selectionRect.x, selectionRect.y, fullWidth - selectionRect.x, selectionRect.height);
+                EditorGUI.DrawRect(rightRect, backgroundColor);
+            }
+            else
+            {
+                // No children - draw full width background
+                Rect bgRect = new Rect(0, selectionRect.y, fullWidth, selectionRect.height);
+                EditorGUI.DrawRect(bgRect, backgroundColor);
+            }
+
+            // Draw the GameObject icon on top
+            Texture2D icon = AssetPreview.GetMiniThumbnail(obj);
+            if (icon != null)
+            {
+                Rect iconRect = new Rect(selectionRect.x, selectionRect.y, 16, 16);
+                GUI.DrawTexture(iconRect, icon, ScaleMode.ScaleToFit);
+            }
 
             // Create style for the text
             GUIStyle textStyle = new GUIStyle(EditorStyles.label);
@@ -39,20 +80,95 @@ namespace nUtils.HierarchyOrganizer
             textStyle.alignment = TextAnchor.MiddleCenter;
             textStyle.normal.textColor = GetContrastColor(backgroundColor);
 
-            // Draw the separator name
-            Rect labelRect = selectionRect;
-            labelRect.xMin = 32;
+            // Draw the separator name centered across the full width
+            Rect labelRect = new Rect(0, selectionRect.y, fullWidth, selectionRect.height);
 
             GUI.Label(labelRect, obj.name, textStyle);
+        }
 
-            // Optionally draw icon indicator
-            Rect iconRect = new Rect(selectionRect.x, selectionRect.y, 16, 16);
-            Color iconColor = separator.GetColor();
-            iconColor.a = 1f;
+        private static void DrawChildOutlineIfUnderSeparator(GameObject obj, Rect selectionRect)
+        {
+            // Look for a parent with HierarchySeparator component
+            Transform parent = obj.transform.parent;
+            HierarchySeparator parentSeparator = null;
 
-            // Draw a small colored square as an icon
-            Rect smallIconRect = new Rect(selectionRect.x + 2, selectionRect.y + 2, 12, 12);
-            EditorGUI.DrawRect(smallIconRect, iconColor);
+            while (parent != null)
+            {
+                parentSeparator = parent.GetComponent<HierarchySeparator>();
+                if (parentSeparator != null)
+                    break;
+                parent = parent.parent;
+            }
+
+            if (parentSeparator == null)
+                return;
+
+            // Check if the parent separator is expanded
+            int parentInstanceID = parentSeparator.gameObject.GetInstanceID();
+            bool isExpanded = IsGameObjectExpanded(parentInstanceID);
+
+            if (!isExpanded)
+                return;
+
+            // Draw outline around this child object
+            Color outlineColor = parentSeparator.GetColor();
+            float outlineThickness = 1f;
+
+            // Calculate the full width
+            float fullWidth = selectionRect.x + selectionRect.width + 16;
+
+            // Draw outline as 4 rects (top, bottom, left, right)
+            Rect topRect = new Rect(0, selectionRect.y, fullWidth, outlineThickness);
+            Rect bottomRect = new Rect(0, selectionRect.yMax - outlineThickness, fullWidth, outlineThickness);
+            Rect leftRect = new Rect(0, selectionRect.y, outlineThickness, selectionRect.height);
+            Rect rightRect = new Rect(fullWidth - outlineThickness, selectionRect.y, outlineThickness, selectionRect.height);
+
+            EditorGUI.DrawRect(topRect, outlineColor);
+            EditorGUI.DrawRect(bottomRect, outlineColor);
+            EditorGUI.DrawRect(leftRect, outlineColor);
+            EditorGUI.DrawRect(rightRect, outlineColor);
+        }
+
+        private static bool IsGameObjectExpanded(int instanceID)
+        {
+            // Use reflection to check if the GameObject is expanded in the hierarchy
+            var windows = Resources.FindObjectsOfTypeAll<SearchableEditorWindow>();
+            foreach (var window in windows)
+            {
+                if (window.GetType().Name == "SceneHierarchyWindow")
+                {
+                    var sceneHierarchy = window.GetType()
+                        .GetProperty("sceneHierarchy", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?
+                        .GetValue(window);
+
+                    if (sceneHierarchy != null)
+                    {
+                        var treeView = sceneHierarchy.GetType()
+                            .GetProperty("treeView", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?
+                            .GetValue(sceneHierarchy);
+
+                        if (treeView != null)
+                        {
+                            var data = treeView.GetType()
+                                .GetProperty("data", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)?
+                                .GetValue(treeView);
+
+                            if (data != null)
+                            {
+                                var isExpandedMethod = data.GetType()
+                                    .GetMethod("IsExpanded", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance, null, new[] { typeof(int) }, null);
+
+                                if (isExpandedMethod != null)
+                                {
+                                    return (bool)isExpandedMethod.Invoke(data, new object[] { instanceID });
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            return false;
         }
 
         public static Color GetContrastColor(Color backgroundColor)

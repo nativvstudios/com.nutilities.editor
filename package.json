@@ -1,33 +1,34 @@
 {
-    "name": "com.nutilities.editor",
-    "version": "1.0.0",
-    "displayName": "nUtilities",
-    "description": "A collection of Unity Editor utilities including nSearch, Scene Organizer, Favorites, and Hierarchy Organizer. Boost your productivity with fast fuzzy search, scene management, asset bookmarking, and visual hierarchy organization.",
-    "unity": "2020.3",
-    "unityRelease": "0f1",
-    "keywords": [
-        "editor",
-        "utilities",
-        "tools",
-        "favorites",
-        "scene",
-        "organizer",
-        "search",
-        "hierarchy",
-        "productivity"
-    ],
-    "author": {
-        "name": "Nativv Studios",
-        "url": "https://nativvstudios.com"
-    },
-    "repository": {
-        "type": "git",
-        "url": "https://github.com/nativvstudios/com.nutilities.editor.git"
-    },
-    "documentationUrl": "https://github.com/nativvstudios/com.nutilities.editor#readme",
-    "changelogUrl": "https://github.com/nativvstudios/com.nutilities.editor/blob/main/CHANGELOG.md",
-    "licensesUrl": "https://github.com/nativvstudios/com.nutilities.editor/blob/main/LICENSE.md",
-    "hideInEditor": false,
-    "type": "tool",
-    "dependencies": {}
+  "name": "com.nutilities.editor",
+  "version": "1.0.0",
+  "displayName": "nUtilities",
+  "description": "A collection of Unity Editor utilities including nSearch, Scene Organizer, Favorites, and Hierarchy Organizer. Boost your productivity with fast fuzzy search, scene management, asset bookmarking, and visual hierarchy organization.",
+  "unity": "2020.3",
+  "unityRelease": "0f1",
+  "keywords": [
+    "editor",
+    "utilities",
+    "tools",
+    "favorites",
+    "scene",
+    "organizer",
+    "search",
+    "hierarchy",
+    "productivity"
+  ],
+  "author": {
+    "name": "Nativv Studios",
+    "url": "https://nativvstudios.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nativvstudios/com.nutilities.editor.git"
+  },
+  "documentationUrl": "https://github.com/nativvstudios/com.nutilities.editor#readme",
+  "changelogUrl": "https://github.com/nativvstudios/com.nutilities.editor/blob/main/CHANGELOG.md",
+  "licensesUrl": "https://github.com/nativvstudios/com.nutilities.editor/blob/main/LICENSE.md",
+  "hideInEditor": false,
+  "type": "tool",
+  "dependencies": {},
+  "_fingerprint": "b5a18b0bb34d1329505f68ae824066d61db05f60"
 }

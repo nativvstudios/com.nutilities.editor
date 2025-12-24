@@ -9,6 +9,8 @@ namespace nUtils.HierarchyOrganizer
         private HierarchySeparator.SeparatorColor selectedColor = HierarchySeparator.SeparatorColor.Blue;
         private Color customColor = new Color(0.3f, 0.5f, 0.8f, 1f);
         private Vector2 scrollPosition;
+        private bool isConvertingExisting = false;
+        private GameObject targetGameObject;
 
         private static readonly (string name, HierarchySeparator.SeparatorColor color)[] presets = new[]
         {
@@ -26,6 +28,22 @@ namespace nUtils.HierarchyOrganizer
         {
             CreateSeparatorWindow window = GetWindow<CreateSeparatorWindow>(true, "Create Separator", true);
             window.minSize = new Vector2(280, 200);
+            
+            // Check if a GameObject is selected and doesn't have the component
+            if (Selection.activeGameObject != null && 
+                Selection.activeGameObject.GetComponent<HierarchySeparator>() == null)
+            {
+                window.isConvertingExisting = true;
+                window.targetGameObject = Selection.activeGameObject;
+                window.separatorName = Selection.activeGameObject.name;
+            }
+            else
+            {
+                window.isConvertingExisting = false;
+                window.targetGameObject = null;
+                window.separatorName = "--- NEW SECTION ---";
+            }
+            
             window.ShowUtility();
         }
 
@@ -107,7 +125,8 @@ namespace nUtils.HierarchyOrganizer
 
             // Create button
             GUI.backgroundColor = new Color(0.4f, 0.7f, 0.4f);
-            if (GUILayout.Button("Create", GUILayout.Height(28)))
+            string buttonText = isConvertingExisting ? "Add Component" : "Create";
+            if (GUILayout.Button(buttonText, GUILayout.Height(28)))
             {
                 CreateSeparator();
                 Close();
@@ -192,25 +211,42 @@ namespace nUtils.HierarchyOrganizer
             if (string.IsNullOrWhiteSpace(separatorName))
                 return;
 
-            GameObject separator = new GameObject(separatorName);
-            HierarchySeparator comp = separator.AddComponent<HierarchySeparator>();
+            GameObject separator;
+            HierarchySeparator comp;
+
+            if (isConvertingExisting && targetGameObject != null)
+            {
+                // Add component to existing GameObject
+                separator = targetGameObject;
+                separator.name = separatorName;
+                comp = Undo.AddComponent<HierarchySeparator>(separator);
+            }
+            else
+            {
+                // Create new GameObject
+                separator = new GameObject(separatorName);
+                comp = separator.AddComponent<HierarchySeparator>();
+
+                if (Selection.activeTransform != null)
+                {
+                    separator.transform.SetParent(Selection.activeTransform.parent);
+                    separator.transform.SetSiblingIndex(Selection.activeTransform.GetSiblingIndex() + 1);
+                }
+
+                separator.transform.localPosition = Vector3.zero;
+                separator.transform.localRotation = Quaternion.identity;
+                separator.transform.localScale = Vector3.one;
+
+                Undo.RegisterCreatedObjectUndo(separator, "Create Hierarchy Separator");
+            }
+
             comp.ColorPreset = selectedColor;
 
             if (selectedColor == HierarchySeparator.SeparatorColor.Custom)
                 comp.CustomColor = customColor;
 
-            if (Selection.activeTransform != null)
-            {
-                separator.transform.SetParent(Selection.activeTransform.parent);
-                separator.transform.SetSiblingIndex(Selection.activeTransform.GetSiblingIndex() + 1);
-            }
-
-            separator.transform.localPosition = Vector3.zero;
-            separator.transform.localRotation = Quaternion.identity;
-            separator.transform.localScale = Vector3.one;
-
-            Undo.RegisterCreatedObjectUndo(separator, "Create Hierarchy Separator");
             Selection.activeGameObject = separator;
+            EditorUtility.SetDirty(separator);
             EditorApplication.RepaintHierarchyWindow();
         }
     }
