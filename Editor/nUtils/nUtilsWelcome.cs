@@ -4,7 +4,16 @@ using UnityEngine;
 public class WelcomeWindow : EditorWindow
 {
     private const string SHOW_ON_STARTUP_KEY = "nUtilities.ShowWelcomeOnStartup";
-    private const string VERSION = "1.0.0";
+    private const string PACKAGE_NAME = "com.nutilities.editor";
+
+    private static string Version
+    {
+        get
+        {
+            var packageInfo = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(WelcomeWindow).Assembly);
+            return packageInfo != null ? packageInfo.version : "Unknown";
+        }
+    }
 
     private static bool showOnStartup = true;
     private Vector2 scrollPosition;
@@ -61,7 +70,7 @@ public class WelcomeWindow : EditorWindow
 
         // Utility cards
         DrawUtilityCard(
-            "🔍 nSearch",
+            "nSearch",
             "Quick access to everything in your project",
             "Fast, fuzzy search for finding files, hierarchy objects, and assets. " +
             "Press Ctrl+Shift+Space anywhere in Unity to open/close.",
@@ -72,7 +81,7 @@ public class WelcomeWindow : EditorWindow
         GUILayout.Space(10);
 
         DrawUtilityCard(
-            "🎬 Scene Organizer",
+            "Scene Organizer",
             "Organize and manage your scenes with ease",
             "Create custom scene groups, organize scenes by project phase, and quickly load " +
             "multiple scenes. Perfect for managing large projects with many scenes.",
@@ -83,18 +92,18 @@ public class WelcomeWindow : EditorWindow
         GUILayout.Space(10);
 
         DrawUtilityCard(
-            "⭐ Favorites",
+            "Favorites",
             "Keep your most-used assets at your fingertips",
             "Bookmark frequently used prefabs, scripts, materials, and more. Organize favorites " +
             "into groups with custom colors. Drag and drop support for quick access.",
             new Color(0.9f, 0.6f, 0.3f),
-            () => EditorApplication.ExecuteMenuItem("Window/nUtilities/Favorites ⭐")
+            () => EditorApplication.ExecuteMenuItem("Window/nUtilities/Favorites")
         );
 
         GUILayout.Space(10);
 
         DrawUtilityCard(
-            "📁 Hierarchy Organizer",
+            "Hierarchy Organizer",
             "Keep your scene hierarchy clean and organized",
             "Create colored separator objects in your hierarchy to visually group GameObjects. " +
             "Quick presets for common categories like Gameplay, Environment, UI, and more.",
@@ -103,11 +112,6 @@ public class WelcomeWindow : EditorWindow
         );
 
         GUILayout.Space(15);
-
-        // Tips section
-        DrawTipsSection();
-
-        GUILayout.Space(10);
 
         // Support section
         DrawSupportSection();
@@ -181,7 +185,7 @@ public class WelcomeWindow : EditorWindow
             normal = { textColor = new Color(0.5f, 0.5f, 0.5f) }
         };
 
-        GUILayout.Label($"v{VERSION}", versionStyle);
+        GUILayout.Label($"v{Version}", versionStyle);
 
         GUILayout.EndVertical();
 
@@ -290,40 +294,6 @@ public class WelcomeWindow : EditorWindow
         GUILayout.EndVertical();
     }
 
-    private void DrawTipsSection()
-    {
-        GUIStyle boxStyle = new GUIStyle(GUI.skin.box)
-        {
-            padding = new RectOffset(15, 15, 12, 12),
-            margin = new RectOffset(20, 20, 0, 0)
-        };
-
-        GUILayout.BeginVertical(boxStyle);
-
-        GUIStyle headerStyle = new GUIStyle(EditorStyles.boldLabel)
-        {
-            fontSize = 13,
-            normal = { textColor = new Color(1f, 0.8f, 0.3f) }
-        };
-
-        GUILayout.Label("💡 Pro Tips", headerStyle);
-
-        GUILayout.Space(5);
-
-        GUIStyle tipStyle = new GUIStyle(EditorStyles.label)
-        {
-            fontSize = 11,
-            wordWrap = true,
-            normal = { textColor = EditorGUIUtility.isProSkin ? new Color(0.8f, 0.8f, 0.8f) : new Color(0.25f, 0.25f, 0.25f) }
-        };
-
-        GUILayout.Label("• Use Ctrl+Shift+Space to toggle nSearch open/closed from anywhere", tipStyle);
-        GUILayout.Label("• Access all utilities from Window > nUtilities menu", tipStyle);
-        GUILayout.Label("• Drag assets directly into Favorites for quick bookmarking", tipStyle);
-
-        GUILayout.EndVertical();
-    }
-
     private void DrawSupportSection()
     {
         GUIStyle boxStyle = new GUIStyle(GUI.skin.box)
@@ -340,7 +310,7 @@ public class WelcomeWindow : EditorWindow
             normal = { textColor = new Color(0.5f, 0.8f, 1.0f) }
         };
 
-        GUILayout.Label("💬 Support & Resources", headerStyle);
+        GUILayout.Label("Support & Resources", headerStyle);
 
         GUILayout.Space(8);
 
@@ -359,7 +329,7 @@ public class WelcomeWindow : EditorWindow
             alignment = TextAnchor.MiddleCenter
         };
 
-        if (GUILayout.Button("🌐 Website\nnativvstudios.com", buttonStyle))
+        if (GUILayout.Button("Website\nnativvstudios.com", buttonStyle))
         {
             Application.OpenURL("https://nativvstudios.com");
         }
@@ -369,7 +339,7 @@ public class WelcomeWindow : EditorWindow
         // GitHub button
         GUI.backgroundColor = new Color(0.4f, 0.4f, 0.45f);
 
-        if (GUILayout.Button("🐙 GitHub\ngithub.com/nativvstudios", buttonStyle))
+        if (GUILayout.Button("GitHub\ngithub.com/nativvstudios", buttonStyle))
         {
             Application.OpenURL("https://github.com/nativvstudios");
         }

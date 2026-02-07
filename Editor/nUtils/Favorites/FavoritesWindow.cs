@@ -18,8 +18,7 @@ public class FavoritesWindow : EditorWindow
     private FavoriteGroup draggedToGroup;
     private bool dragToUngrouped;
 
-    [MenuItem("Window/Favorites ⭐")]
-    [MenuItem("Window/nUtilities/Favorites ⭐")]
+    [MenuItem("Window/nUtilities/Favorites")]
     public static void ShowWindow()
     {
         var window = GetWindow<FavoritesWindow>("Favorites");
