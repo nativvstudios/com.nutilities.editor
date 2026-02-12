@@ -65,17 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Known Issues
 - None at release
 
----
-
-## Future Roadmap
-
-### Planned for v1.1.0
-- UI Toolkit (UIElements) modernization option
-- Export/Import favorites and scene groups
-- Project-wide asset tagging system
-- Quick actions system for common tasks
-- Performance optimizations for large projects
-
 ### Under Consideration
 - Git integration for scene status indicators
 - Asset dependency viewer
