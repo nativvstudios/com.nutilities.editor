@@ -5,7 +5,7 @@ namespace nUtils.HierarchyOrganizer
 {
     public static class HierarchyOrganizerMenu
     {
-        [MenuItem("GameObject/nUtilities/Hierarchy Organizer", false, 0)]
+        [MenuItem("GameObject/nUtilities/Create Separator", false, 0)]
         private static void OpenCreationWindow()
         {
             CreateSeparatorWindow.ShowWindow();
