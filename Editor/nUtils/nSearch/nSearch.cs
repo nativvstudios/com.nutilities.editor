@@ -19,10 +19,12 @@ public class nSearch : EditorWindow
     private bool keyboardNavigationActive = false;
 
     // Layout
-    private readonly float windowWidth = 600f;
-    private readonly float minWindowHeight = 62f;
-    private readonly float maxWindowHeight = 500f;
-    private readonly float itemHeight = 48f;
+    private const float WindowWidth = 600f;
+    private const float MinWindowHeight = 62f;
+    private const float MaxWindowHeight = 500f;
+    private const float ItemHeight = 48f;
+    private const float SearchAreaHeight = 54f;
+    private const float FooterHeight = 24f;
 
     // Settings (persisted via EditorPrefs)
     private int maxVisibleResults = 8;
@@ -39,6 +41,7 @@ public class nSearch : EditorWindow
     private GUIStyle _noResultsStyle;
     private GUIStyle _noResultsHintStyle;
     private GUIStyle _footerStyle;
+    private GUIStyle _statusStyle;
     private bool _stylesReady;
 
     // Cached icon
@@ -96,9 +99,8 @@ public class nSearch : EditorWindow
         currentWindow._placeholderText = placeholderTexts[UnityEngine.Random.Range(0, placeholderTexts.Length)];
         currentWindow.ShowPopup();
 
-        float height = currentWindow.minWindowHeight;
-        currentWindow.minSize = new Vector2(currentWindow.windowWidth, height);
-        currentWindow.maxSize = new Vector2(currentWindow.windowWidth, height);
+        currentWindow.minSize = new Vector2(WindowWidth, MinWindowHeight);
+        currentWindow.maxSize = new Vector2(WindowWidth, MinWindowHeight);
 
         WindowUtilities.CenterWindow(currentWindow);
     }
@@ -141,6 +143,8 @@ public class nSearch : EditorWindow
     {
         if (_stylesReady) return;
 
+        bool pro = EditorGUIUtility.isProSkin;
+
         // Try loading Unity's built-in search icon
         var iconContent = EditorGUIUtility.IconContent("d_Search Icon");
         if (iconContent != null && iconContent.image != null)
@@ -180,7 +184,7 @@ public class nSearch : EditorWindow
         {
             fontSize = 13,
             fontStyle = FontStyle.Normal,
-            normal = { textColor = EditorGUIUtility.isProSkin
+            normal = { textColor = pro
                 ? new Color(0.88f, 0.88f, 0.88f)
                 : new Color(0.1f, 0.1f, 0.1f) },
         };
@@ -188,7 +192,7 @@ public class nSearch : EditorWindow
         _resultPathStyle = new GUIStyle(EditorStyles.miniLabel)
         {
             fontSize = 10,
-            normal = { textColor = EditorGUIUtility.isProSkin
+            normal = { textColor = pro
                 ? new Color(0.5f, 0.5f, 0.5f)
                 : new Color(0.45f, 0.45f, 0.45f) },
         };
@@ -197,7 +201,7 @@ public class nSearch : EditorWindow
         {
             alignment = TextAnchor.MiddleCenter,
             fontSize = 13,
-            normal = { textColor = EditorGUIUtility.isProSkin
+            normal = { textColor = pro
                 ? new Color(0.45f, 0.45f, 0.45f)
                 : new Color(0.5f, 0.5f, 0.5f) },
         };
@@ -206,7 +210,7 @@ public class nSearch : EditorWindow
         {
             alignment = TextAnchor.MiddleCenter,
             fontSize = 10,
-            normal = { textColor = EditorGUIUtility.isProSkin
+            normal = { textColor = pro
                 ? new Color(0.38f, 0.38f, 0.38f)
                 : new Color(0.55f, 0.55f, 0.55f) },
         };
@@ -215,10 +219,12 @@ public class nSearch : EditorWindow
         {
             alignment = TextAnchor.MiddleCenter,
             fontSize = 10,
-            normal = { textColor = EditorGUIUtility.isProSkin
+            normal = { textColor = pro
                 ? new Color(0.45f, 0.45f, 0.45f)
                 : new Color(0.5f, 0.5f, 0.5f) },
         };
+
+        _statusStyle = new GUIStyle(EditorStyles.miniLabel);
 
         _stylesReady = true;
     }
@@ -280,8 +286,7 @@ public class nSearch : EditorWindow
     void DrawSearchBar()
     {
         // Search area background (slightly lighter/darker than window)
-        float searchAreaHeight = 54f;
-        Rect searchBgRect = new Rect(1, 1, position.width - 2, searchAreaHeight);
+        Rect searchBgRect = new Rect(1, 1, position.width - 2, SearchAreaHeight);
         Color searchBg = EditorGUIUtility.isProSkin
             ? new Color(0.22f, 0.22f, 0.22f, 1f)
             : new Color(0.96f, 0.96f, 0.96f, 1f);
@@ -369,19 +374,18 @@ public class nSearch : EditorWindow
 
     void DrawResults()
     {
-        float topHeight = 54f + 1f + 4f + 8f; // search area + sep + gap + space
-        float footerHeight = 24f;
-        float scrollViewHeight = position.height - topHeight - footerHeight;
+        float topHeight = SearchAreaHeight + 13f; // + separator + gaps
+        float scrollViewHeight = position.height - topHeight - FooterHeight;
 
         Rect scrollRect = GUILayoutUtility.GetRect(position.width, scrollViewHeight);
-        float contentHeight = searchResults.Count * itemHeight;
+        float contentHeight = searchResults.Count * ItemHeight;
         Rect contentRect = new Rect(0, 0, scrollRect.width - 14, contentHeight);
 
         scrollPosition = GUI.BeginScrollView(scrollRect, scrollPosition, contentRect);
 
         for (int i = 0; i < searchResults.Count; i++)
         {
-            Rect itemRect = new Rect(0, i * itemHeight, contentRect.width, itemHeight);
+            Rect itemRect = new Rect(0, i * ItemHeight, contentRect.width, ItemHeight);
             DrawResultItem(searchResults[i], i, itemRect);
         }
 
@@ -454,7 +458,7 @@ public class nSearch : EditorWindow
     void DrawFooter()
     {
         // Separator
-        Rect sepRect = new Rect(0, position.height - 24, position.width, 1);
+        Rect sepRect = new Rect(0, position.height - FooterHeight, position.width, 1);
         Color sepColor = EditorGUIUtility.isProSkin
             ? new Color(0.10f, 0.10f, 0.10f, 0.7f)
             : new Color(0.72f, 0.72f, 0.72f, 0.5f);
@@ -469,7 +473,7 @@ public class nSearch : EditorWindow
 
         // Hint text
         Rect hintRect = new Rect(0, position.height - 22, position.width, 20);
-        GUI.Label(hintRect, "\u2191\u2193 Navigate  \u2022  Enter Select  \u2022  Esc Close", _footerStyle);
+        GUI.Label(hintRect, "Tab/\u2191\u2193 Navigate  \u2022  Enter Open  \u2022  Esc Close", _footerStyle);
     }
 
     void DrawSettings()
@@ -535,13 +539,10 @@ public class nSearch : EditorWindow
         GUILayout.FlexibleSpace();
 
         string status = indexingComplete ? "\u2713 Index ready" : "\u21bb Indexing...";
-        GUIStyle statusStyle = new GUIStyle(EditorStyles.miniLabel)
-        {
-            normal = { textColor = indexingComplete
-                ? new Color(0.3f, 0.8f, 0.3f)
-                : new Color(0.8f, 0.7f, 0.2f) }
-        };
-        GUILayout.Label(status, statusStyle);
+        _statusStyle.normal.textColor = indexingComplete
+            ? new Color(0.3f, 0.8f, 0.3f)
+            : new Color(0.8f, 0.7f, 0.2f);
+        GUILayout.Label(status, _statusStyle);
 
         GUILayout.Space(8);
         GUILayout.EndVertical();
@@ -565,20 +566,16 @@ public class nSearch : EditorWindow
 
         switch (Event.current.keyCode)
         {
+            case KeyCode.Tab:
+                NavigateSelection(Event.current.shift ? -1 : 1);
+                break;
+
             case KeyCode.DownArrow:
-                selectedIndex = (selectedIndex + 1) % Mathf.Max(1, searchResults.Count);
-                keyboardNavigationActive = true;
-                Event.current.Use();
-                EnsureVisible();
-                Repaint();
+                NavigateSelection(1);
                 break;
 
             case KeyCode.UpArrow:
-                selectedIndex = (selectedIndex - 1 + searchResults.Count) % Mathf.Max(1, searchResults.Count);
-                keyboardNavigationActive = true;
-                Event.current.Use();
-                EnsureVisible();
-                Repaint();
+                NavigateSelection(-1);
                 break;
 
             case KeyCode.Return:
@@ -597,11 +594,22 @@ public class nSearch : EditorWindow
         }
     }
 
+    void NavigateSelection(int direction)
+    {
+        if (searchResults.Count == 0) return;
+        selectedIndex = (selectedIndex + direction + searchResults.Count) % searchResults.Count;
+        keyboardNavigationActive = true;
+        Event.current.Use();
+        EnsureVisible();
+        PingSelectedResult();
+        Repaint();
+    }
+
     void EnsureVisible()
     {
-        float itemTop = selectedIndex * itemHeight;
-        float itemBottom = itemTop + itemHeight;
-        float viewHeight = position.height - 67f - 24f; // top area - footer
+        float itemTop = selectedIndex * ItemHeight;
+        float itemBottom = itemTop + ItemHeight;
+        float viewHeight = position.height - (SearchAreaHeight + 13f) - FooterHeight;
 
         if (itemBottom > scrollPosition.y + viewHeight)
             scrollPosition.y = itemBottom - viewHeight;
@@ -609,21 +617,29 @@ public class nSearch : EditorWindow
             scrollPosition.y = itemTop;
     }
 
+    void PingSelectedResult()
+    {
+        if (selectedIndex >= 0 && selectedIndex < searchResults.Count)
+        {
+            var target = searchResults[selectedIndex].Target;
+            if (target != null)
+                EditorGUIUtility.PingObject(target);
+        }
+    }
+
     void SelectResult(SearchResult result)
     {
         if (result.Target != null)
         {
             Selection.activeObject = result.Target;
-            EditorGUIUtility.PingObject(result.Target);
+            AssetDatabase.OpenAsset(result.Target);
         }
         Close();
     }
 
     void ResizeWindow()
     {
-        float topArea = 62f; // search bar area + padding
-
-        float contentHeight = topArea;
+        float contentHeight = MinWindowHeight; // search bar area + padding
 
         if (displaySettings)
         {
@@ -632,16 +648,16 @@ public class nSearch : EditorWindow
         else if (searchResults.Count > 0)
         {
             int visibleCount = Mathf.Min(searchResults.Count, maxVisibleResults);
-            contentHeight += 5 + visibleCount * itemHeight + 24; // sep+gap + items + footer
+            contentHeight += 5 + visibleCount * ItemHeight + FooterHeight;
         }
         else if (!string.IsNullOrEmpty(searchQuery))
         {
             contentHeight += 50;
         }
 
-        float targetHeight = Mathf.Clamp(contentHeight, minWindowHeight, maxWindowHeight);
-        minSize = new Vector2(windowWidth, targetHeight);
-        maxSize = new Vector2(windowWidth, targetHeight);
+        float targetHeight = Mathf.Clamp(contentHeight, MinWindowHeight, MaxWindowHeight);
+        minSize = new Vector2(WindowWidth, targetHeight);
+        maxSize = new Vector2(WindowWidth, targetHeight);
     }
 
     void BuildFileIndex()
