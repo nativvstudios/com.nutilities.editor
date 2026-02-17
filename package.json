@@ -1,6 +1,6 @@
 {
   "name": "com.nutilities.editor",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "displayName": "nUtilities",
   "description": "A collection of Unity Editor utilities including nSearch, Scene Organizer, Favorites, and Hierarchy Organizer. Boost your productivity with fast fuzzy search, scene management, asset bookmarking, and visual hierarchy organization.",
   "unity": "2020.3",
