@@ -9,7 +9,7 @@ public class nSearch : EditorWindow
     private string searchQuery = "";
     private Vector2 scrollPosition;
     private List<SearchResult> searchResults = new List<SearchResult>();
-    private TrieNode root = new TrieNode();
+    private FileIndex fileIndex = new FileIndex();
     private static nSearch currentWindow;
     private static double lastCloseTime = 0;
     private bool indexingComplete = false;
@@ -17,6 +17,7 @@ public class nSearch : EditorWindow
     private bool displaySettings = false;
     private int selectedIndex = 0;
     private bool keyboardNavigationActive = false;
+    private List<ISearchCommand> commands;
 
     // Layout
     private const float WindowWidth = 600f;
@@ -42,6 +43,8 @@ public class nSearch : EditorWindow
     private GUIStyle _noResultsHintStyle;
     private GUIStyle _footerStyle;
     private GUIStyle _statusStyle;
+    private GUIStyle _helpPrefixStyle;
+    private GUIStyle _helpDescStyle;
     private bool _stylesReady;
 
     // Cached icon
@@ -119,6 +122,10 @@ public class nSearch : EditorWindow
     void OnEnable()
     {
         LoadSettings();
+        commands = new List<ISearchCommand>
+        {
+            new CreateCommand()
+        };
         if (!indexingComplete && indexIterator == null)
             BuildFileIndex();
     }
@@ -226,6 +233,21 @@ public class nSearch : EditorWindow
 
         _statusStyle = new GUIStyle(EditorStyles.miniLabel);
 
+        _helpPrefixStyle = new GUIStyle(EditorStyles.miniLabel)
+        {
+            fontStyle = FontStyle.Bold,
+            normal = { textColor = pro
+                ? new Color(0.55f, 0.75f, 1f)
+                : new Color(0.15f, 0.35f, 0.65f) },
+        };
+
+        _helpDescStyle = new GUIStyle(EditorStyles.miniLabel)
+        {
+            normal = { textColor = pro
+                ? new Color(0.55f, 0.55f, 0.55f)
+                : new Color(0.45f, 0.45f, 0.45f) },
+        };
+
         _stylesReady = true;
     }
 
@@ -266,6 +288,15 @@ public class nSearch : EditorWindow
         }
 
         GUILayout.EndVertical();
+
+        // Popup windows don't repaint on a timer, so schedule repaints for caret blinking
+        if (Event.current.type == EventType.Repaint)
+        {
+            EditorApplication.delayCall += () =>
+            {
+                if (this != null) Repaint();
+            };
+        }
     }
 
     void DrawWindowBorder()
@@ -418,7 +449,7 @@ public class nSearch : EditorWindow
         // Selection highlight
         if (index == selectedIndex)
         {
-            Rect highlightRect = new Rect(rect.x + 5, rect.y + 2, rect.width - 10, rect.height - 4);
+            Rect highlightRect = new Rect(rect.x + 10, rect.y + 2, rect.width - 20, rect.height - 4);
             Color selColor = EditorGUIUtility.isProSkin
                 ? new Color(0.24f, 0.50f, 0.90f, 0.50f)
                 : new Color(0.23f, 0.50f, 0.87f, 0.30f);
@@ -476,6 +507,14 @@ public class nSearch : EditorWindow
         GUI.Label(hintRect, "Tab/\u2191\u2193 Navigate  \u2022  Enter Open  \u2022  Esc Close", _footerStyle);
     }
 
+    void DrawHelpRow(string prefix, string description)
+    {
+        GUILayout.BeginHorizontal();
+        GUILayout.Label(prefix, _helpPrefixStyle, GUILayout.Width(70));
+        GUILayout.Label(description, _helpDescStyle);
+        GUILayout.EndHorizontal();
+    }
+
     void DrawSettings()
     {
         GUILayout.Space(8);
@@ -515,7 +554,7 @@ public class nSearch : EditorWindow
             if (includePackages != prevIncludePackages)
             {
                 indexingComplete = false;
-                root = new TrieNode();
+                fileIndex = new FileIndex();
                 BuildFileIndex();
             }
         }
@@ -532,9 +571,34 @@ public class nSearch : EditorWindow
         if (GUILayout.Button("Rebuild Index", GUILayout.Height(24)))
         {
             indexingComplete = false;
-            root = new TrieNode();
+            fileIndex = new FileIndex();
             BuildFileIndex();
         }
+
+        GUILayout.Space(8);
+
+        // Separator
+        Rect helpSepRect = GUILayoutUtility.GetRect(0, 1, GUILayout.ExpandWidth(true));
+        EditorGUI.DrawRect(helpSepRect, EditorGUIUtility.isProSkin
+            ? new Color(0.25f, 0.25f, 0.25f) : new Color(0.72f, 0.72f, 0.72f));
+
+        GUILayout.Space(8);
+
+        GUILayout.Label("Commands", EditorStyles.boldLabel);
+        GUILayout.Space(4);
+
+        // Built-in prefixes
+        DrawHelpRow("s:", "Open settings");
+        DrawHelpRow("h:", "Search scene hierarchy");
+
+        // Registered commands
+        foreach (var cmd in commands)
+            DrawHelpRow(cmd.Prefix, cmd.Description);
+
+        GUILayout.Space(2);
+
+        if (enableCalculator)
+            DrawHelpRow("(math)", "Type any expression, e.g. sqrt(144)");
 
         GUILayout.FlexibleSpace();
 
@@ -596,10 +660,11 @@ public class nSearch : EditorWindow
 
     void NavigateSelection(int direction)
     {
-        if (searchResults.Count == 0) return;
-        selectedIndex = (selectedIndex + direction + searchResults.Count) % searchResults.Count;
-        keyboardNavigationActive = true;
         Event.current.Use();
+        if (searchResults.Count == 0) return;
+        int next = selectedIndex + direction;
+        if (next < 0 || next >= searchResults.Count) return;
+        selectedIndex = next;
         EnsureVisible();
         PingSelectedResult();
         Repaint();
@@ -629,7 +694,11 @@ public class nSearch : EditorWindow
 
     void SelectResult(SearchResult result)
     {
-        if (result.Target != null)
+        if (result.OnSelect != null)
+        {
+            result.OnSelect();
+        }
+        else if (result.Target != null)
         {
             Selection.activeObject = result.Target;
             AssetDatabase.OpenAsset(result.Target);
@@ -643,7 +712,7 @@ public class nSearch : EditorWindow
 
         if (displaySettings)
         {
-            contentHeight += 300;
+            contentHeight += 400;
         }
         else if (searchResults.Count > 0)
         {
@@ -662,7 +731,7 @@ public class nSearch : EditorWindow
 
     void BuildFileIndex()
     {
-        root = new TrieNode();
+        fileIndex.Clear();
         string[] allAssets = AssetDatabase.GetAllAssetPaths();
         EditorApplication.update += IndexNextBatch;
         indexIterator = ((IEnumerable<string>)allAssets).GetEnumerator();
@@ -672,19 +741,20 @@ public class nSearch : EditorWindow
     {
         int processed = 0;
         int batchSize = 200;
+        bool hasMore = true;
 
-        while (processed < batchSize && indexIterator.MoveNext())
+        while (processed < batchSize && (hasMore = indexIterator.MoveNext()))
         {
             string path = indexIterator.Current;
             if (path.StartsWith("Assets/") || (includePackages && path.StartsWith("Packages/")))
             {
                 string fileName = Path.GetFileNameWithoutExtension(path).ToLower();
-                root.Insert(fileName, path);
+                fileIndex.Add(fileName, path);
             }
             processed++;
         }
 
-        if (!indexIterator.MoveNext())
+        if (!hasMore)
         {
             EditorApplication.update -= IndexNextBatch;
             indexIterator = null;
@@ -701,6 +771,16 @@ public class nSearch : EditorWindow
 
         if (string.IsNullOrEmpty(searchQuery) || displaySettings)
             return;
+
+        // Check registered commands
+        foreach (var cmd in commands)
+        {
+            if (searchQuery.StartsWith(cmd.Prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                cmd.GetResults(searchQuery.Substring(cmd.Prefix.Length).Trim(), searchResults);
+                return;
+            }
+        }
 
         if (searchQuery.StartsWith("h:"))
         {
@@ -725,8 +805,7 @@ public class nSearch : EditorWindow
         }
 
         // File search
-        var paths = root.Search(searchQuery.ToLower());
-        var rankedResults = RankResults(paths, searchQuery.ToLower());
+        var rankedResults = fileIndex.Search(searchQuery.ToLower());
 
         foreach (var path in rankedResults)
         {
@@ -783,52 +862,4 @@ public class nSearch : EditorWindow
         }
     }
 
-    List<string> RankResults(List<string> paths, string query)
-    {
-        var scored = new List<(string path, int score)>();
-
-        foreach (var path in paths)
-        {
-            string fileName = Path.GetFileNameWithoutExtension(path).ToLower();
-            int score = 0;
-
-            if (fileName == query) score += 1000;
-            else if (fileName.StartsWith(query)) score += 500;
-            else if (fileName.Contains(query)) score += 250;
-            else score += FuzzyScore(fileName, query);
-
-            score -= fileName.Length;
-            scored.Add((path, score));
-        }
-
-        scored.Sort((a, b) => b.score.CompareTo(a.score));
-        return scored.ConvertAll(x => x.path);
-    }
-
-    int FuzzyScore(string text, string query)
-    {
-        int score = 0;
-        int textIndex = 0;
-
-        foreach (char c in query)
-        {
-            int foundAt = text.IndexOf(c, textIndex);
-            if (foundAt >= 0)
-            {
-                score += 10;
-                if (foundAt == textIndex) score += 5;
-                textIndex = foundAt + 1;
-            }
-        }
-
-        return score;
-    }
-
-    private class SearchResult
-    {
-        public string Name;
-        public string Path;
-        public Texture2D Icon;
-        public UnityEngine.Object Target;
-    }
 }
