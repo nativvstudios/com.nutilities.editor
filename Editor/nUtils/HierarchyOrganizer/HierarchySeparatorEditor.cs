@@ -10,12 +10,12 @@ namespace nUtils.HierarchyOrganizer
 
         static HierarchySeparatorEditor()
         {
-            EditorApplication.hierarchyWindowItemOnGUI += OnHierarchyWindowItemGUI;
+            EditorApplication.hierarchyWindowItemByEntityIdOnGUI += OnHierarchyWindowItemGUI;
         }
 
-        private static void OnHierarchyWindowItemGUI(int instanceID, Rect selectionRect)
+        private static void OnHierarchyWindowItemGUI(EntityId entityId, Rect selectionRect)
         {
-            GameObject obj = EditorUtility.InstanceIDToObject(instanceID) as GameObject;
+            GameObject obj = EditorUtility.EntityIdToObject(entityId) as GameObject;
 
             if (obj == null)
                 return;
@@ -104,8 +104,8 @@ namespace nUtils.HierarchyOrganizer
                 return;
 
             // Check if the parent separator is expanded
-            int parentInstanceID = parentSeparator.gameObject.GetInstanceID();
-            bool isExpanded = IsGameObjectExpanded(parentInstanceID);
+            EntityId parentEntityId = parentSeparator.gameObject.GetEntityId();
+            bool isExpanded = IsGameObjectExpanded(parentEntityId);
 
             if (!isExpanded)
                 return;
@@ -129,7 +129,7 @@ namespace nUtils.HierarchyOrganizer
             EditorGUI.DrawRect(rightRect, outlineColor);
         }
 
-        private static bool IsGameObjectExpanded(int instanceID)
+        private static bool IsGameObjectExpanded(EntityId entityId)
         {
             // Use reflection to check if the GameObject is expanded in the hierarchy
             var windows = Resources.FindObjectsOfTypeAll<SearchableEditorWindow>();
@@ -155,12 +155,13 @@ namespace nUtils.HierarchyOrganizer
 
                             if (data != null)
                             {
+                                // Unity 6.3+ exposes IsExpanded(EntityId) on the hierarchy tree view data source.
                                 var isExpandedMethod = data.GetType()
-                                    .GetMethod("IsExpanded", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance, null, new[] { typeof(int) }, null);
+                                    .GetMethod("IsExpanded", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance, null, new[] { typeof(EntityId) }, null);
 
                                 if (isExpandedMethod != null)
                                 {
-                                    return (bool)isExpandedMethod.Invoke(data, new object[] { instanceID });
+                                    return (bool)isExpandedMethod.Invoke(data, new object[] { entityId });
                                 }
                             }
                         }
