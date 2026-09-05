@@ -40,19 +40,29 @@ public static class AdvancedMathEvaluator
             if (string.IsNullOrWhiteSpace(expression))
                 return null;
 
+            // Parsing throws on anything that isn't an expression, and nSearch calls this
+            // on every keystroke. Reject plain search text up front so typing an asset
+            // name doesn't raise (and swallow) an exception per character.
+            if (!LooksLikeMath(expression))
+                return null;
+
             // Preprocess the expression
             expression = expression.ToLower().Replace(" ", "");
+
+            // Handle implicit multiplication (e.g., 2pi -> 2*pi, 5(3+2) -> 5*(3+2)).
+            // This has to run before constants are substituted: in "2pi" there is no word
+            // boundary between the digit and the name, so \bpi\b would never match and the
+            // parser would then choke on a bare "pi". Inserting the "*" first creates the
+            // boundary the substitution below needs.
+            expression = Regex.Replace(expression, @"(\d)([a-z(])", "$1*$2");
+            expression = Regex.Replace(expression, @"(\))(\d)", "$1*$2");
+            expression = Regex.Replace(expression, @"(\))(\()", "$1*$2");
 
             // Replace constants
             foreach (var constant in Constants)
             {
                 expression = Regex.Replace(expression, @"\b" + constant.Key + @"\b", constant.Value.ToString(CultureInfo.InvariantCulture));
             }
-
-            // Handle implicit multiplication (e.g., 2pi -> 2*pi, 5(3+2) -> 5*(3+2))
-            expression = Regex.Replace(expression, @"(\d)([a-z(])", "$1*$2");
-            expression = Regex.Replace(expression, @"(\))(\d)", "$1*$2");
-            expression = Regex.Replace(expression, @"(\))(\()", "$1*$2");
 
             double result = Evaluate(expression);
 
@@ -70,6 +80,55 @@ public static class AdvancedMathEvaluator
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Cheap gate in front of the parser: the text must be built from digits, operators
+    /// and known function/constant names, and must mention at least one value.
+    /// </summary>
+    private static bool LooksLikeMath(string expression)
+    {
+        bool hasValue = false;
+
+        for (int i = 0; i < expression.Length; i++)
+        {
+            char c = expression[i];
+
+            if (char.IsWhiteSpace(c))
+                continue;
+
+            if (c >= '0' && c <= '9')
+            {
+                hasValue = true;
+                continue;
+            }
+
+            if (c == '.' || c == '+' || c == '-' || c == '*' || c == '/' ||
+                c == '%' || c == '^' || c == '(' || c == ')')
+                continue;
+
+            if (!char.IsLetter(c))
+                return false;
+
+            // Letters are only allowed as a whole known function or constant name.
+            int start = i;
+            while (i < expression.Length && char.IsLetter(expression[i]))
+                i++;
+
+            string word = expression.Substring(start, i - start).ToLowerInvariant();
+            i--;
+
+            if (Constants.ContainsKey(word))
+            {
+                hasValue = true;
+                continue;
+            }
+
+            if (!Functions.ContainsKey(word))
+                return false;
+        }
+
+        return hasValue;
     }
 
     private static double Evaluate(string expression)

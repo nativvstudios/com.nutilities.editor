@@ -2,30 +2,55 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
+using UnityEditor.SceneManagement;
 using UnityEngine;
+using UnityEngine.UIElements;
 
 public class nSearch : EditorWindow
 {
+    private enum ResultAction
+    {
+        Open,
+        Ping,
+        Reveal,
+    }
+
     private string searchQuery = "";
-    private Vector2 scrollPosition;
-    private List<SearchResult> searchResults = new List<SearchResult>();
-    private FileIndex fileIndex = new FileIndex();
+    private readonly List<SearchResult> searchResults = new List<SearchResult>();
     private static nSearch currentWindow;
     private static double lastCloseTime = 0;
-    private bool indexingComplete = false;
-    private IEnumerator<string> indexIterator = null;
     private bool displaySettings = false;
+
+    // The index is shared editor state, not window state: the window is recreated on
+    // every toggle, and rebuilding a large project's index each time is what made
+    // opening nSearch feel slow.
+    private static readonly FileIndex sharedIndex = new FileIndex();
+    private static IEnumerator<string> indexIterator;
+    private static bool indexReady;
+    private static bool indexBuilding;
+    private static bool indexStale = true;
+    private static bool indexIncludesPackages;
+
+    // Searching is debounced so a fast typist runs one search, not one per character.
+    private const long SearchDebounceMs = 50;
+    private bool searchPending;
+    private IVisualElementScheduledItem debounce;
+
     private int selectedIndex = 0;
-    private bool keyboardNavigationActive = false;
+    private string highlightQuery = "";
     private List<ISearchCommand> commands;
 
     // Layout
-    private const float WindowWidth = 600f;
-    private const float MinWindowHeight = 62f;
-    private const float MaxWindowHeight = 500f;
-    private const float ItemHeight = 48f;
-    private const float SearchAreaHeight = 54f;
+    private const float WindowWidth = 640f;
+    private const float SearchRowHeight = 46f;
+    private const float RowHeight = 38f;
     private const float FooterHeight = 24f;
+    private const float ResultsPadding = 6f;
+    private const float EmptyStateHeight = 60f;
+    private const float SettingsHeight = 340f;
+    private const float SettingsPadding = 14f;
+    private const float MinWindowHeight = SearchRowHeight + 2f;
+    private const float MaxWindowHeight = 560f;
 
     // Settings (persisted via EditorPrefs)
     private int maxVisibleResults = 8;
@@ -33,25 +58,21 @@ public class nSearch : EditorWindow
     private bool enableCalculator = true;
     private bool alsoSearchHierarchy = false;
 
-    // Cached styles
-    private GUIStyle _searchStyle;
-    private GUIStyle _placeholderStyle;
-    private GUIStyle _clearBtnStyle;
-    private GUIStyle _resultNameStyle;
-    private GUIStyle _resultPathStyle;
-    private GUIStyle _noResultsStyle;
-    private GUIStyle _noResultsHintStyle;
-    private GUIStyle _footerStyle;
-    private GUIStyle _statusStyle;
-    private GUIStyle _helpPrefixStyle;
-    private GUIStyle _helpDescStyle;
-    private bool _stylesReady;
+    // UI
+    private VisualElement root;
+    private TextField field;
+    private Button clearButton;
+    private ScrollView scroll;
+    private VisualElement emptyState;
+    private Label emptyHint;
+    private VisualElement settingsPanel;
+    private VisualElement settingsContent;
+    private Label statusLabel;
+    private VisualElement footer;
+    private Label countLabel;
+    private VisualElement hints;
+    private readonly List<VisualElement> rows = new List<VisualElement>();
 
-    // Cached icon
-    private Texture _searchIcon;
-
-    // Placeholder text
-    private string _placeholderText = "Search or calculate...";
     private static readonly string[] placeholderTexts = new[]
     {
         "Searching the galaxy...",
@@ -76,6 +97,8 @@ public class nSearch : EditorWindow
         "I've seen things you wouldn't believe...",
     };
 
+    private string placeholderText = "Search or calculate...";
+
     [MenuItem("Window/nUtilities/nSearch %#SPACE")]
     public static void ToggleWindow()
     {
@@ -99,13 +122,13 @@ public class nSearch : EditorWindow
     {
         currentWindow = CreateInstance<nSearch>();
         currentWindow.titleContent = new GUIContent("nSearch");
-        currentWindow._placeholderText = placeholderTexts[UnityEngine.Random.Range(0, placeholderTexts.Length)];
+        currentWindow.placeholderText = placeholderTexts[UnityEngine.Random.Range(0, placeholderTexts.Length)];
         currentWindow.ShowPopup();
 
         currentWindow.minSize = new Vector2(WindowWidth, MinWindowHeight);
         currentWindow.maxSize = new Vector2(WindowWidth, MinWindowHeight);
 
-        WindowUtilities.CenterWindow(currentWindow);
+        WindowUtilities.PositionForSpotlight(currentWindow, 0.26f);
     }
 
     void OnDestroy()
@@ -122,13 +145,600 @@ public class nSearch : EditorWindow
     void OnEnable()
     {
         LoadSettings();
-        commands = new List<ISearchCommand>
-        {
-            new CreateCommand()
-        };
-        if (!indexingComplete && indexIterator == null)
-            BuildFileIndex();
+        commands = new List<ISearchCommand> { new CreateCommand() };
+        EnsureIndex();
     }
+
+    // ------------------------------------------------------------------ UI setup
+
+    void CreateGUI()
+    {
+        root = rootVisualElement;
+        root.AddToClassList("nsearch-root");
+
+        var sheet = LoadStyleSheet();
+        if (sheet != null)
+            root.styleSheets.Add(sheet);
+
+        BuildSearchRow();
+        BuildResults();
+        BuildEmptyState();
+        BuildSettings();
+        BuildFooter();
+
+        root.RegisterCallback<KeyDownEvent>(OnKeyDown, TrickleDown.TrickleDown);
+
+        RefreshResults();
+
+        // The popup has to hand focus to the field itself, and only once layout exists.
+        root.schedule.Execute(() =>
+        {
+            field.Focus();
+            field.SelectAll();
+        }).StartingIn(0);
+    }
+
+    StyleSheet LoadStyleSheet()
+    {
+        // Resolve the sheet next to this script rather than hard-coding a package path,
+        // so the package can be renamed, embedded or moved without breaking the styling.
+        var script = MonoScript.FromScriptableObject(this);
+        string scriptPath = script != null ? AssetDatabase.GetAssetPath(script) : null;
+
+        if (!string.IsNullOrEmpty(scriptPath))
+        {
+            string dir = Path.GetDirectoryName(scriptPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                string ussPath = dir.Replace('\\', '/') + "/nSearchStyles.uss";
+                var sheet = AssetDatabase.LoadAssetAtPath<StyleSheet>(ussPath);
+                if (sheet != null)
+                    return sheet;
+            }
+        }
+
+        Debug.LogWarning("nSearch: could not locate nSearchStyles.uss next to nSearch.cs; the window will render unstyled.");
+        return null;
+    }
+
+    void BuildSearchRow()
+    {
+        var searchRow = new VisualElement();
+        searchRow.AddToClassList("nsearch-search-row");
+
+        var icon = new Image { scaleMode = ScaleMode.ScaleToFit };
+        icon.AddToClassList("nsearch-search-icon");
+        var iconContent = EditorGUIUtility.IconContent(EditorGUIUtility.isProSkin ? "d_Search Icon" : "Search Icon");
+        if (iconContent != null)
+            icon.image = iconContent.image;
+        searchRow.Add(icon);
+
+        field = new TextField();
+        field.AddToClassList("nsearch-field");
+        field.textEdition.placeholder = placeholderText;
+        field.textEdition.hidePlaceholderOnFocus = false;
+        field.RegisterValueChangedCallback(OnQueryChanged);
+        searchRow.Add(field);
+
+        clearButton = new Button(ClearQuery) { text = "×" };
+        clearButton.AddToClassList("nsearch-clear");
+        clearButton.style.display = DisplayStyle.None;
+        searchRow.Add(clearButton);
+
+        root.Add(searchRow);
+    }
+
+    void BuildResults()
+    {
+        scroll = new ScrollView(ScrollViewMode.Vertical);
+        scroll.AddToClassList("nsearch-scroll");
+        scroll.horizontalScrollerVisibility = ScrollerVisibility.Hidden;
+        root.Add(scroll);
+    }
+
+    void BuildEmptyState()
+    {
+        emptyState = new VisualElement();
+        emptyState.AddToClassList("nsearch-empty");
+
+        var title = new Label("No results found");
+        title.AddToClassList("nsearch-empty__title");
+        emptyState.Add(title);
+
+        emptyHint = new Label("Try a different search term");
+        emptyHint.AddToClassList("nsearch-empty__hint");
+        emptyState.Add(emptyHint);
+
+        root.Add(emptyState);
+    }
+
+    void BuildFooter()
+    {
+        footer = new VisualElement();
+        footer.AddToClassList("nsearch-footer");
+
+        countLabel = new Label();
+        countLabel.AddToClassList("nsearch-footer__count");
+        footer.Add(countLabel);
+
+        hints = new VisualElement();
+        hints.AddToClassList("nsearch-hints");
+        footer.Add(hints);
+
+        root.Add(footer);
+    }
+
+    static VisualElement MakeHint(string key, string label)
+    {
+        var hint = new VisualElement();
+        hint.AddToClassList("nsearch-hint");
+
+        var keyLabel = new Label(key);
+        keyLabel.AddToClassList("nsearch-hint__key");
+        hint.Add(keyLabel);
+
+        var textLabel = new Label(label);
+        textLabel.AddToClassList("nsearch-hint__label");
+        hint.Add(textLabel);
+
+        return hint;
+    }
+
+    // ------------------------------------------------------------------- typing
+
+    void OnQueryChanged(ChangeEvent<string> evt)
+    {
+        searchQuery = evt.newValue;
+        clearButton.style.display = string.IsNullOrEmpty(searchQuery) ? DisplayStyle.None : DisplayStyle.Flex;
+
+        bool wasSettings = displaySettings;
+        displaySettings = searchQuery.StartsWith("s:");
+        selectedIndex = 0;
+
+        if (displaySettings != wasSettings)
+        {
+            // Switching in or out of settings resizes the window, so don't defer it.
+            searchPending = false;
+            RunSearch();
+        }
+        else
+        {
+            ScheduleSearch();
+        }
+    }
+
+    void ClearQuery()
+    {
+        field.SetValueWithoutNotify("");
+        searchQuery = "";
+        clearButton.style.display = DisplayStyle.None;
+        displaySettings = false;
+        selectedIndex = 0;
+        searchPending = false;
+        RunSearch();
+        field.Focus();
+    }
+
+    void ScheduleSearch()
+    {
+        searchPending = true;
+
+        if (debounce == null)
+            debounce = root.schedule.Execute(() => { if (searchPending) RunSearch(); });
+
+        debounce.ExecuteLater(SearchDebounceMs);
+    }
+
+    void FlushPendingSearch()
+    {
+        if (searchPending)
+            RunSearch();
+    }
+
+    void RunSearch()
+    {
+        searchPending = false;
+        PerformSearch();
+        RefreshResults();
+        ResizeWindow();
+    }
+
+    // ------------------------------------------------------------------ results
+
+    void RefreshResults()
+    {
+        bool showSettings = displaySettings;
+        bool showResults = !showSettings && searchResults.Count > 0;
+        bool showEmpty = !showSettings && !showResults && !string.IsNullOrEmpty(searchQuery);
+
+        settingsPanel.style.display = showSettings ? DisplayStyle.Flex : DisplayStyle.None;
+        scroll.style.display = showResults ? DisplayStyle.Flex : DisplayStyle.None;
+        emptyState.style.display = showEmpty ? DisplayStyle.Flex : DisplayStyle.None;
+        footer.style.display = (showResults || showSettings) ? DisplayStyle.Flex : DisplayStyle.None;
+
+        if (showSettings)
+        {
+            RefreshStatusLabel();
+            countLabel.text = "Settings";
+            hints.Clear();
+            hints.Add(MakeHint("esc", "Close"));
+            return;
+        }
+
+        if (showEmpty)
+            emptyHint.text = indexReady ? "Try a different search term" : "Still indexing the project…";
+
+        if (!showResults)
+            return;
+
+        EnsureRowCount(searchResults.Count);
+
+        for (int i = 0; i < searchResults.Count; i++)
+            BindRow(rows[i], searchResults[i], i);
+
+        for (int i = searchResults.Count; i < rows.Count; i++)
+            rows[i].style.display = DisplayStyle.None;
+
+        if (selectedIndex >= searchResults.Count)
+            selectedIndex = searchResults.Count - 1;
+        if (selectedIndex < 0)
+            selectedIndex = 0;
+
+        UpdateSelection(false);
+
+        countLabel.text = searchResults.Count == 1 ? "1 result" : searchResults.Count + " results";
+    }
+
+    void EnsureRowCount(int count)
+    {
+        while (rows.Count < count)
+        {
+            var row = MakeRow();
+            rows.Add(row);
+            scroll.Add(row);
+        }
+    }
+
+    VisualElement MakeRow()
+    {
+        var row = new VisualElement();
+        row.AddToClassList("nsearch-row");
+
+        var icon = new Image { name = "icon", scaleMode = ScaleMode.ScaleToFit };
+        icon.AddToClassList("nsearch-row__icon");
+        row.Add(icon);
+
+        var text = new VisualElement();
+        text.AddToClassList("nsearch-row__text");
+
+        var nameLabel = new Label { name = "name" };
+        nameLabel.AddToClassList("nsearch-row__name");
+        text.Add(nameLabel);
+
+        var pathLabel = new Label { name = "path" };
+        pathLabel.AddToClassList("nsearch-row__path");
+        text.Add(pathLabel);
+
+        row.Add(text);
+
+        var badge = new Label { name = "badge" };
+        badge.AddToClassList("nsearch-row__badge");
+        row.Add(badge);
+
+        row.RegisterCallback<MouseEnterEvent>(_ =>
+        {
+            if (row.userData is int index && index != selectedIndex)
+            {
+                selectedIndex = index;
+                UpdateSelection(false);
+            }
+        });
+
+        row.RegisterCallback<MouseDownEvent>(evt =>
+        {
+            if (evt.button != 0 || !(row.userData is int index))
+                return;
+
+            selectedIndex = index;
+            UpdateSelection(false);
+            Activate(index, evt.actionKey ? ResultAction.Reveal : evt.shiftKey ? ResultAction.Ping : ResultAction.Open);
+            evt.StopPropagation();
+        });
+
+        return row;
+    }
+
+    void BindRow(VisualElement row, SearchResult result, int index)
+    {
+        row.style.display = DisplayStyle.Flex;
+        row.userData = index;
+
+        var icon = row.Q<Image>("icon");
+        icon.image = result.Icon;
+        icon.style.display = result.Icon != null ? DisplayStyle.Flex : DisplayStyle.None;
+
+        ApplyHighlightedName(row.Q<Label>("name"), result.Name, index == selectedIndex);
+
+        row.Q<Label>("path").text = result.Path;
+
+        var badge = row.Q<Label>("badge");
+        string badgeText = BadgeFor(result);
+        badge.text = badgeText;
+        badge.style.display = string.IsNullOrEmpty(badgeText) ? DisplayStyle.None : DisplayStyle.Flex;
+    }
+
+    /// <summary>
+    /// Tints the matched run of the query inside the result name. Rich text is switched
+    /// off for names containing '&lt;', which would otherwise be parsed as markup.
+    /// </summary>
+    void ApplyHighlightedName(Label label, string name, bool selected)
+    {
+        int at = string.IsNullOrEmpty(name) || string.IsNullOrEmpty(highlightQuery) || name.IndexOf('<') >= 0
+            ? -1
+            : name.IndexOf(highlightQuery, StringComparison.OrdinalIgnoreCase);
+
+        if (at < 0)
+        {
+            label.enableRichText = false;
+            label.text = name;
+            return;
+        }
+
+        // The selected row sits on Unity's selection blue, where the accent would vanish.
+        string accent = selected
+            ? "#FFFFFF"
+            : EditorGUIUtility.isProSkin ? "#6EA8FF" : "#1D4E89";
+
+        label.enableRichText = true;
+        label.text = name.Substring(0, at)
+                     + "<color=" + accent + "><b>"
+                     + name.Substring(at, highlightQuery.Length)
+                     + "</b></color>"
+                     + name.Substring(at + highlightQuery.Length);
+    }
+
+    static string BadgeFor(SearchResult result)
+    {
+        if (!string.IsNullOrEmpty(result.AssetPath))
+        {
+            if (AssetDatabase.IsValidFolder(result.AssetPath))
+                return "FOLDER";
+
+            string ext = Path.GetExtension(result.AssetPath);
+            return string.IsNullOrEmpty(ext) ? "ASSET" : ext.TrimStart('.').ToUpperInvariant();
+        }
+
+        if (result.Target != null)
+            return "SCENE";
+
+        if (result.OnSelect != null)
+            return result.ActionLabel == "Copy" ? "MATH" : "MENU";
+
+        return string.Empty;
+    }
+
+    // ---------------------------------------------------------------- selection
+
+    void UpdateSelection(bool ping)
+    {
+        for (int i = 0; i < rows.Count; i++)
+        {
+            bool selected = i == selectedIndex;
+            rows[i].EnableInClassList("nsearch-row--selected", selected);
+
+            // Re-tint the match: it flips to white on the row that gains the blue fill.
+            if (i < searchResults.Count)
+                ApplyHighlightedName(rows[i].Q<Label>("name"), searchResults[i].Name, selected);
+        }
+
+        if (selectedIndex >= 0 && selectedIndex < rows.Count)
+            scroll.ScrollTo(rows[selectedIndex]);
+
+        UpdateHints();
+
+        if (ping)
+            PingSelectedResult();
+    }
+
+    void UpdateHints()
+    {
+        hints.Clear();
+
+        if (selectedIndex < 0 || selectedIndex >= searchResults.Count)
+        {
+            hints.Add(MakeHint("esc", "Close"));
+            return;
+        }
+
+        var result = searchResults[selectedIndex];
+        hints.Add(MakeHint("↵", result.ActionLabel ?? "Open"));
+
+        bool isAsset = !string.IsNullOrEmpty(result.AssetPath);
+        bool isSceneObject = result.Target != null && !isAsset;
+
+        if (isAsset || isSceneObject)
+            hints.Add(MakeHint("⇧↵", "Ping"));
+
+        if (isAsset)
+            hints.Add(MakeHint(ActionKeyName + "↵", "Explorer"));
+
+        hints.Add(MakeHint("esc", "Close"));
+    }
+
+    static string ActionKeyName
+    {
+        get { return Application.platform == RuntimePlatform.OSXEditor ? "⌘" : "Ctrl"; }
+    }
+
+    void NavigateSelection(int direction)
+    {
+        if (searchResults.Count == 0)
+            return;
+
+        int next = selectedIndex + direction;
+        if (next < 0 || next >= searchResults.Count)
+            return;
+
+        selectedIndex = next;
+        UpdateSelection(true);
+    }
+
+    void PingSelectedResult()
+    {
+        if (selectedIndex < 0 || selectedIndex >= searchResults.Count)
+            return;
+
+        var target = searchResults[selectedIndex].ResolveTarget();
+        if (target != null)
+            EditorGUIUtility.PingObject(target);
+    }
+
+    // ------------------------------------------------------------------ keyboard
+
+    void OnKeyDown(KeyDownEvent evt)
+    {
+        if (evt.keyCode == KeyCode.Space && evt.shiftKey && evt.actionKey)
+        {
+            lastCloseTime = EditorApplication.timeSinceStartup;
+            Close();
+            evt.StopPropagation();
+            evt.PreventDefault();
+            return;
+        }
+
+        if (evt.keyCode == KeyCode.Escape)
+        {
+            Close();
+            evt.StopPropagation();
+            evt.PreventDefault();
+            return;
+        }
+
+        // In settings, Tab/arrows/Enter drive the controls; swallowing them for result
+        // navigation is what left that panel keyboard-dead.
+        if (displaySettings)
+            return;
+
+        switch (evt.keyCode)
+        {
+            case KeyCode.Tab:
+                FlushPendingSearch();
+                NavigateSelection(evt.shiftKey ? -1 : 1);
+                break;
+
+            case KeyCode.DownArrow:
+                FlushPendingSearch();
+                NavigateSelection(1);
+                break;
+
+            case KeyCode.UpArrow:
+                FlushPendingSearch();
+                NavigateSelection(-1);
+                break;
+
+            case KeyCode.Return:
+            case KeyCode.KeypadEnter:
+                FlushPendingSearch();
+                Activate(selectedIndex,
+                    evt.actionKey ? ResultAction.Reveal :
+                    evt.shiftKey ? ResultAction.Ping :
+                    ResultAction.Open);
+                break;
+
+            default:
+                return;
+        }
+
+        evt.StopPropagation();
+        evt.PreventDefault();
+    }
+
+    // -------------------------------------------------------------- activation
+
+    void Activate(int index, ResultAction action)
+    {
+        if (index < 0 || index >= searchResults.Count)
+            return;
+
+        var result = searchResults[index];
+
+        if (result.OnSelect != null)
+        {
+            result.OnSelect();
+            Close();
+            return;
+        }
+
+        var target = result.ResolveTarget();
+        if (target == null)
+            return;
+
+        switch (action)
+        {
+            case ResultAction.Reveal:
+                string path = !string.IsNullOrEmpty(result.AssetPath)
+                    ? result.AssetPath
+                    : AssetDatabase.GetAssetPath(target);
+
+                if (string.IsNullOrEmpty(path))
+                    return; // A scene object has no file to reveal.
+
+                EditorUtility.RevealInFinder(path);
+                break;
+
+            case ResultAction.Ping:
+                Selection.activeObject = target;
+                EditorGUIUtility.PingObject(target);
+                break;
+
+            case ResultAction.Open:
+                if (!OpenTarget(result, target))
+                    return; // User cancelled; leave the window up.
+                break;
+        }
+
+        Close();
+    }
+
+    bool OpenTarget(SearchResult result, UnityEngine.Object target)
+    {
+        // Scene objects: select, ping, and frame them in the Scene view.
+        if (string.IsNullOrEmpty(result.AssetPath))
+        {
+            Selection.activeObject = target;
+            EditorGUIUtility.PingObject(target);
+
+            if (SceneView.lastActiveSceneView != null)
+                SceneView.lastActiveSceneView.FrameSelected();
+
+            return true;
+        }
+
+        // Folders have nothing to open, so reveal them in the Project window instead.
+        if (AssetDatabase.IsValidFolder(result.AssetPath))
+        {
+            Selection.activeObject = target;
+            EditorGUIUtility.PingObject(target);
+            return true;
+        }
+
+        // Scenes replace what's loaded, so give the user the chance to save first.
+        if (result.AssetPath.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo())
+                return false;
+
+            EditorSceneManager.OpenScene(result.AssetPath);
+            return true;
+        }
+
+        Selection.activeObject = target;
+        EditorGUIUtility.PingObject(target);
+        AssetDatabase.OpenAsset(target);
+        return true;
+    }
+
+    // ------------------------------------------------------------------ settings
 
     void LoadSettings()
     {
@@ -146,582 +756,184 @@ public class nSearch : EditorWindow
         EditorPrefs.SetBool("nSearch.AlsoSearchHierarchy", alsoSearchHierarchy);
     }
 
-    void EnsureStyles()
+    void BuildSettings()
     {
-        if (_stylesReady) return;
+        settingsPanel = new VisualElement();
+        settingsPanel.AddToClassList("nsearch-settings");
 
-        bool pro = EditorGUIUtility.isProSkin;
-
-        // Try loading Unity's built-in search icon
-        var iconContent = EditorGUIUtility.IconContent("d_Search Icon");
-        if (iconContent != null && iconContent.image != null)
-            _searchIcon = iconContent.image;
-        if (_searchIcon == null)
+        settingsContent = new VisualElement();
+        settingsContent.AddToClassList("nsearch-settings__content");
+        settingsContent.RegisterCallback<GeometryChangedEvent>(_ =>
         {
-            iconContent = EditorGUIUtility.IconContent("Search Icon");
-            if (iconContent != null) _searchIcon = iconContent.image;
-        }
-
-        _searchStyle = new GUIStyle(EditorStyles.textField)
-        {
-            fontSize = 18,
-            alignment = TextAnchor.MiddleLeft,
-            fixedHeight = 36,
-            padding = new RectOffset(32, 28, 0, 0),
-            margin = new RectOffset(0, 0, 0, 0),
-        };
-
-        _placeholderStyle = new GUIStyle(EditorStyles.label)
-        {
-            fontSize = 18,
-            alignment = TextAnchor.MiddleLeft,
-            normal = { textColor = new Color(0.5f, 0.5f, 0.5f, 0.4f) },
-        };
-
-        _clearBtnStyle = new GUIStyle(EditorStyles.label)
-        {
-            fontSize = 18,
-            alignment = TextAnchor.MiddleCenter,
-            normal = { textColor = new Color(0.5f, 0.5f, 0.5f, 0.6f) },
-            hover = { textColor = new Color(0.7f, 0.7f, 0.7f, 0.9f) },
-            padding = new RectOffset(0, 0, 0, 2),
-        };
-
-        _resultNameStyle = new GUIStyle(EditorStyles.label)
-        {
-            fontSize = 13,
-            fontStyle = FontStyle.Normal,
-            normal = { textColor = pro
-                ? new Color(0.88f, 0.88f, 0.88f)
-                : new Color(0.1f, 0.1f, 0.1f) },
-        };
-
-        _resultPathStyle = new GUIStyle(EditorStyles.miniLabel)
-        {
-            fontSize = 10,
-            normal = { textColor = pro
-                ? new Color(0.5f, 0.5f, 0.5f)
-                : new Color(0.45f, 0.45f, 0.45f) },
-        };
-
-        _noResultsStyle = new GUIStyle(EditorStyles.label)
-        {
-            alignment = TextAnchor.MiddleCenter,
-            fontSize = 13,
-            normal = { textColor = pro
-                ? new Color(0.45f, 0.45f, 0.45f)
-                : new Color(0.5f, 0.5f, 0.5f) },
-        };
-
-        _noResultsHintStyle = new GUIStyle(EditorStyles.miniLabel)
-        {
-            alignment = TextAnchor.MiddleCenter,
-            fontSize = 10,
-            normal = { textColor = pro
-                ? new Color(0.38f, 0.38f, 0.38f)
-                : new Color(0.55f, 0.55f, 0.55f) },
-        };
-
-        _footerStyle = new GUIStyle(EditorStyles.miniLabel)
-        {
-            alignment = TextAnchor.MiddleCenter,
-            fontSize = 10,
-            normal = { textColor = pro
-                ? new Color(0.45f, 0.45f, 0.45f)
-                : new Color(0.5f, 0.5f, 0.5f) },
-        };
-
-        _statusStyle = new GUIStyle(EditorStyles.miniLabel);
-
-        _helpPrefixStyle = new GUIStyle(EditorStyles.miniLabel)
-        {
-            fontStyle = FontStyle.Bold,
-            normal = { textColor = pro
-                ? new Color(0.55f, 0.75f, 1f)
-                : new Color(0.15f, 0.35f, 0.65f) },
-        };
-
-        _helpDescStyle = new GUIStyle(EditorStyles.miniLabel)
-        {
-            normal = { textColor = pro
-                ? new Color(0.55f, 0.55f, 0.55f)
-                : new Color(0.45f, 0.45f, 0.45f) },
-        };
-
-        _stylesReady = true;
-    }
-
-    void OnGUI()
-    {
-        EnsureStyles();
-        HandleKeyboardInput();
-
-        // Window background
-        Rect bgRect = new Rect(0, 0, position.width, position.height);
-        Color windowBg = EditorGUIUtility.isProSkin
-            ? new Color(0.18f, 0.18f, 0.18f, 0.99f)
-            : new Color(0.92f, 0.92f, 0.92f, 0.99f);
-        EditorGUI.DrawRect(bgRect, windowBg);
-
-        // 1px border around the popup
-        DrawWindowBorder();
-
-        GUILayout.BeginVertical();
-
-        // Search bar area
-        DrawSearchBar();
-
-        // Content area
-        if (displaySettings)
-        {
-            DrawSettings();
-        }
-        else if (searchResults.Count > 0)
-        {
-            DrawSeparatorLine();
-            DrawResults();
-        }
-        else if (!string.IsNullOrEmpty(searchQuery))
-        {
-            DrawSeparatorLine();
-            DrawNoResults();
-        }
-
-        GUILayout.EndVertical();
-
-        // Popup windows don't repaint on a timer, so schedule repaints for caret blinking
-        if (Event.current.type == EventType.Repaint)
-        {
-            EditorApplication.delayCall += () =>
-            {
-                if (this != null) Repaint();
-            };
-        }
-    }
-
-    void DrawWindowBorder()
-    {
-        Color border = EditorGUIUtility.isProSkin
-            ? new Color(0.08f, 0.08f, 0.08f, 0.9f)
-            : new Color(0.55f, 0.55f, 0.55f, 0.9f);
-
-        float w = position.width;
-        float h = position.height;
-
-        EditorGUI.DrawRect(new Rect(0, 0, w, 1), border);
-        EditorGUI.DrawRect(new Rect(0, h - 1, w, 1), border);
-        EditorGUI.DrawRect(new Rect(0, 0, 1, h), border);
-        EditorGUI.DrawRect(new Rect(w - 1, 0, 1, h), border);
-    }
-
-    void DrawSearchBar()
-    {
-        // Search area background (slightly lighter/darker than window)
-        Rect searchBgRect = new Rect(1, 1, position.width - 2, SearchAreaHeight);
-        Color searchBg = EditorGUIUtility.isProSkin
-            ? new Color(0.22f, 0.22f, 0.22f, 1f)
-            : new Color(0.96f, 0.96f, 0.96f, 1f);
-        EditorGUI.DrawRect(searchBgRect, searchBg);
-
-        GUILayout.Space(9);
-
-        GUILayout.BeginHorizontal();
-        GUILayout.Space(10);
-
-        EditorGUI.BeginChangeCheck();
-        GUI.SetNextControlName("SearchField");
-        searchQuery = GUILayout.TextField(searchQuery, _searchStyle, GUILayout.ExpandWidth(true));
-        Rect searchRect = GUILayoutUtility.GetLastRect();
-
-        // Search icon
-        if (_searchIcon != null)
-        {
-            Rect iconRect = new Rect(searchRect.x + 7, searchRect.y + 9, 18, 18);
-            Color prevColor = GUI.color;
-            GUI.color = new Color(1f, 1f, 1f, 0.5f);
-            GUI.DrawTexture(iconRect, _searchIcon, ScaleMode.ScaleToFit);
-            GUI.color = prevColor;
-        }
-
-        // Placeholder text
-        if (string.IsNullOrEmpty(searchQuery))
-        {
-            Rect placeholderRect = new Rect(
-                searchRect.x + 32, searchRect.y, searchRect.width - 60, searchRect.height);
-            GUI.Label(placeholderRect, _placeholderText, _placeholderStyle);
-        }
-
-        // Clear button
-        if (!string.IsNullOrEmpty(searchQuery))
-        {
-            Rect clearRect = new Rect(searchRect.xMax - 26, searchRect.y, 24, searchRect.height);
-            EditorGUIUtility.AddCursorRect(clearRect, MouseCursor.Link);
-
-            if (GUI.Button(clearRect, "\u00d7", _clearBtnStyle))
-            {
-                searchQuery = "";
-                GUI.FocusControl("SearchField");
-                selectedIndex = 0;
-                scrollPosition = Vector2.zero;
-                PerformSearch();
+            if (displaySettings)
                 ResizeWindow();
-            }
-        }
+        });
+        settingsPanel.Add(settingsContent);
 
-        if (EditorGUI.EndChangeCheck())
+        var title = new Label("Settings");
+        title.AddToClassList("nsearch-settings__title");
+        settingsContent.Add(title);
+
+        var visible = new SliderInt("Max Visible Results", 4, 12)
         {
-            displaySettings = searchQuery.StartsWith("s:");
-            selectedIndex = 0;
-            scrollPosition = Vector2.zero;
-            PerformSearch();
-            ResizeWindow();
-        }
-
-        GUILayout.Space(10);
-        GUILayout.EndHorizontal();
-
-        // Auto-focus
-        if (Event.current.type == EventType.Layout)
+            value = maxVisibleResults,
+            showInputField = true,
+        };
+        visible.tooltip = "How many results to show before scrolling";
+        visible.RegisterValueChangedCallback(evt =>
         {
-            if (GUI.GetNameOfFocusedControl() != "SearchField")
-            {
-                GUI.FocusControl("SearchField");
-                Repaint();
-            }
-        }
-
-        GUILayout.Space(8);
-    }
-
-    void DrawSeparatorLine()
-    {
-        Rect sepRect = GUILayoutUtility.GetRect(position.width, 1);
-        Color sepColor = EditorGUIUtility.isProSkin
-            ? new Color(0.10f, 0.10f, 0.10f, 0.8f)
-            : new Color(0.72f, 0.72f, 0.72f, 0.6f);
-        EditorGUI.DrawRect(sepRect, sepColor);
-        GUILayout.Space(4);
-    }
-
-    void DrawResults()
-    {
-        float topHeight = SearchAreaHeight + 13f; // + separator + gaps
-        float scrollViewHeight = position.height - topHeight - FooterHeight;
-
-        Rect scrollRect = GUILayoutUtility.GetRect(position.width, scrollViewHeight);
-        float contentHeight = searchResults.Count * ItemHeight;
-        Rect contentRect = new Rect(0, 0, scrollRect.width - 14, contentHeight);
-
-        scrollPosition = GUI.BeginScrollView(scrollRect, scrollPosition, contentRect);
-
-        for (int i = 0; i < searchResults.Count; i++)
-        {
-            Rect itemRect = new Rect(0, i * ItemHeight, contentRect.width, ItemHeight);
-            DrawResultItem(searchResults[i], i, itemRect);
-        }
-
-        GUI.EndScrollView();
-        DrawFooter();
-    }
-
-    void DrawResultItem(SearchResult result, int index, Rect rect)
-    {
-        Event e = Event.current;
-        bool isHovered = rect.Contains(e.mousePosition - scrollPosition);
-
-        if (isHovered && e.type == EventType.MouseMove)
-        {
-            selectedIndex = index;
-            keyboardNavigationActive = false;
-            Repaint();
-        }
-
-        // Subtle separator between items
-        if (index > 0)
-        {
-            Rect sepRect = new Rect(rect.x + 10, rect.y, rect.width - 20, 1);
-            Color sepColor = EditorGUIUtility.isProSkin
-                ? new Color(0.14f, 0.14f, 0.14f, 0.4f)
-                : new Color(0.72f, 0.72f, 0.72f, 0.25f);
-            EditorGUI.DrawRect(sepRect, sepColor);
-        }
-
-        // Selection highlight
-        if (index == selectedIndex)
-        {
-            Rect highlightRect = new Rect(rect.x + 10, rect.y + 2, rect.width - 20, rect.height - 4);
-            Color selColor = EditorGUIUtility.isProSkin
-                ? new Color(0.24f, 0.50f, 0.90f, 0.50f)
-                : new Color(0.23f, 0.50f, 0.87f, 0.30f);
-            EditorGUI.DrawRect(highlightRect, selColor);
-        }
-
-        // Click
-        if (e.type == EventType.MouseDown && e.button == 0 && isHovered)
-        {
-            SelectResult(result);
-            e.Use();
-            return;
-        }
-
-        // Icon
-        Rect iconRect = new Rect(rect.x + 14, rect.y + 6, 36, 36);
-        if (result.Icon != null)
-            GUI.DrawTexture(iconRect, result.Icon, ScaleMode.ScaleToFit);
-
-        // Name
-        Rect labelRect = new Rect(rect.x + 58, rect.y + 6, rect.width - 70, 20);
-        GUI.Label(labelRect, result.Name, _resultNameStyle);
-
-        // Path
-        Rect pathRect = new Rect(rect.x + 58, rect.y + 26, rect.width - 70, 16);
-        GUI.Label(pathRect, result.Path, _resultPathStyle);
-    }
-
-    void DrawNoResults()
-    {
-        GUILayout.FlexibleSpace();
-        GUILayout.Label("No results found", _noResultsStyle);
-        GUILayout.Label("Try a different search term", _noResultsHintStyle);
-        GUILayout.FlexibleSpace();
-    }
-
-    void DrawFooter()
-    {
-        // Separator
-        Rect sepRect = new Rect(0, position.height - FooterHeight, position.width, 1);
-        Color sepColor = EditorGUIUtility.isProSkin
-            ? new Color(0.10f, 0.10f, 0.10f, 0.7f)
-            : new Color(0.72f, 0.72f, 0.72f, 0.5f);
-        EditorGUI.DrawRect(sepRect, sepColor);
-
-        // Footer background
-        Rect footerBg = new Rect(0, position.height - 23, position.width, 23);
-        Color footerBgColor = EditorGUIUtility.isProSkin
-            ? new Color(0.16f, 0.16f, 0.16f, 1f)
-            : new Color(0.88f, 0.88f, 0.88f, 1f);
-        EditorGUI.DrawRect(footerBg, footerBgColor);
-
-        // Hint text
-        Rect hintRect = new Rect(0, position.height - 22, position.width, 20);
-        GUI.Label(hintRect, "Tab/\u2191\u2193 Navigate  \u2022  Enter Open  \u2022  Esc Close", _footerStyle);
-    }
-
-    void DrawHelpRow(string prefix, string description)
-    {
-        GUILayout.BeginHorizontal();
-        GUILayout.Label(prefix, _helpPrefixStyle, GUILayout.Width(70));
-        GUILayout.Label(description, _helpDescStyle);
-        GUILayout.EndHorizontal();
-    }
-
-    void DrawSettings()
-    {
-        GUILayout.Space(8);
-        GUILayout.BeginHorizontal();
-        GUILayout.Space(14);
-        GUILayout.BeginVertical();
-
-        GUILayout.Label("Settings", EditorStyles.boldLabel);
-        GUILayout.Space(6);
-
-        EditorGUI.BeginChangeCheck();
-
-        maxVisibleResults = EditorGUILayout.IntSlider(
-            new GUIContent("Max Visible Results", "How many results to show before scrolling"),
-            maxVisibleResults, 4, 12);
-
-        GUILayout.Space(4);
-
-        alsoSearchHierarchy = EditorGUILayout.Toggle(
-            new GUIContent("Also Search Hierarchy", "Include scene objects in asset search results (no h: prefix needed)"),
-            alsoSearchHierarchy);
-
-        enableCalculator = EditorGUILayout.Toggle(
-            new GUIContent("Enable Calculator", "Evaluate math expressions like 2+2 or sin(45)"),
-            enableCalculator);
-
-        bool prevIncludePackages = includePackages;
-        includePackages = EditorGUILayout.Toggle(
-            new GUIContent("Include Packages", "Also index assets from the Packages folder"),
-            includePackages);
-
-        if (EditorGUI.EndChangeCheck())
-        {
+            maxVisibleResults = evt.newValue;
             SaveSettings();
+            NoteSettingChange("Max Visible Results: " + evt.newValue);
+        });
+        settingsContent.Add(visible);
 
-            // Rebuild index if package scope changed
-            if (includePackages != prevIncludePackages)
+        settingsContent.Add(MakeSettingToggle(
+            "Also Search Hierarchy",
+            "Include scene objects in asset search results (no h: prefix needed)",
+            alsoSearchHierarchy,
+            value => alsoSearchHierarchy = value));
+
+        settingsContent.Add(MakeSettingToggle(
+            "Enable Calculator",
+            "Evaluate math expressions like 2+2 or sin(45)",
+            enableCalculator,
+            value => enableCalculator = value));
+
+        settingsContent.Add(MakeSettingToggle(
+            "Include Packages",
+            "Also index assets from the Packages folder",
+            includePackages,
+            value =>
             {
-                indexingComplete = false;
-                fileIndex = new FileIndex();
-                BuildFileIndex();
-            }
-        }
+                includePackages = value;
+                EnsureIndex();
+                RefreshStatusLabel();
+            }));
 
-        GUILayout.Space(8);
+        settingsContent.Add(MakeRule());
 
-        // Separator
-        Rect sepRect = GUILayoutUtility.GetRect(0, 1, GUILayout.ExpandWidth(true));
-        EditorGUI.DrawRect(sepRect, EditorGUIUtility.isProSkin
-            ? new Color(0.25f, 0.25f, 0.25f) : new Color(0.72f, 0.72f, 0.72f));
-
-        GUILayout.Space(8);
-
-        if (GUILayout.Button("Rebuild Index", GUILayout.Height(24)))
+        var rebuild = new Button(() =>
         {
-            indexingComplete = false;
-            fileIndex = new FileIndex();
-            BuildFileIndex();
-        }
+            indexStale = true;
+            EnsureIndex();
+            RefreshStatusLabel();
+        })
+        { text = "Rebuild Index" };
+        rebuild.AddToClassList("nsearch-rebuild");
+        settingsContent.Add(rebuild);
 
-        GUILayout.Space(8);
+        settingsContent.Add(MakeRule());
 
-        // Separator
-        Rect helpSepRect = GUILayoutUtility.GetRect(0, 1, GUILayout.ExpandWidth(true));
-        EditorGUI.DrawRect(helpSepRect, EditorGUIUtility.isProSkin
-            ? new Color(0.25f, 0.25f, 0.25f) : new Color(0.72f, 0.72f, 0.72f));
+        var commandsTitle = new Label("Commands");
+        commandsTitle.AddToClassList("nsearch-settings__section");
+        settingsContent.Add(commandsTitle);
 
-        GUILayout.Space(8);
+        settingsContent.Add(MakeHelpRow("s:", "Open settings"));
+        settingsContent.Add(MakeHelpRow("h:", "Search scene hierarchy"));
 
-        GUILayout.Label("Commands", EditorStyles.boldLabel);
-        GUILayout.Space(4);
-
-        // Built-in prefixes
-        DrawHelpRow("s:", "Open settings");
-        DrawHelpRow("h:", "Search scene hierarchy");
-
-        // Registered commands
         foreach (var cmd in commands)
-            DrawHelpRow(cmd.Prefix, cmd.Description);
+            settingsContent.Add(MakeHelpRow(cmd.Prefix, cmd.Description));
 
-        GUILayout.Space(2);
+        settingsContent.Add(MakeHelpRow("(math)", "Type any expression, e.g. sqrt(144)"));
 
-        if (enableCalculator)
-            DrawHelpRow("(math)", "Type any expression, e.g. sqrt(144)");
+        statusLabel = new Label();
+        statusLabel.AddToClassList("nsearch-status");
+        settingsContent.Add(statusLabel);
 
-        GUILayout.FlexibleSpace();
+        settingsPanel.style.display = DisplayStyle.None;
+        root.Add(settingsPanel);
+    }
 
-        string status = indexingComplete ? "\u2713 Index ready" : "\u21bb Indexing...";
-        _statusStyle.normal.textColor = indexingComplete
+    /// <summary>
+    /// A toggle that behaves the way Unity's IMGUI ones do. In UI Toolkit the label is a
+    /// separate, inert element, so clicking the words - which is where the habit sends
+    /// you - does nothing at all; this wires it up to the value.
+    /// </summary>
+    Toggle MakeSettingToggle(string label, string tooltip, bool value, Action<bool> apply)
+    {
+        var toggle = new Toggle(label) { value = value, tooltip = tooltip };
+
+        toggle.labelElement.RegisterCallback<ClickEvent>(_ => toggle.value = !toggle.value);
+
+        toggle.RegisterValueChangedCallback(evt =>
+        {
+            apply(evt.newValue);
+            SaveSettings();
+            NoteSettingChange(label + ": " + (evt.newValue ? "On" : "Off"));
+        });
+
+        return toggle;
+    }
+
+    /// <summary>
+    /// Confirms a change in the footer. Settings take effect on the next search, so
+    /// without this the panel gives no sign that anything happened.
+    /// </summary>
+    void NoteSettingChange(string message)
+    {
+        if (countLabel != null)
+            countLabel.text = message;
+    }
+
+    static VisualElement MakeRule()
+    {
+        var rule = new VisualElement();
+        rule.AddToClassList("nsearch-settings__rule");
+        return rule;
+    }
+
+    static VisualElement MakeHelpRow(string prefix, string description)
+    {
+        var row = new VisualElement();
+        row.AddToClassList("nsearch-help-row");
+
+        var prefixLabel = new Label(prefix);
+        prefixLabel.AddToClassList("nsearch-help-row__prefix");
+        row.Add(prefixLabel);
+
+        var descLabel = new Label(description);
+        descLabel.AddToClassList("nsearch-help-row__desc");
+        row.Add(descLabel);
+
+        return row;
+    }
+
+    void RefreshStatusLabel()
+    {
+        if (statusLabel == null)
+            return;
+
+        statusLabel.text = indexReady
+            ? "✓ Index ready — " + sharedIndex.Count + " assets"
+            : "↻ Indexing…";
+        statusLabel.style.color = indexReady
             ? new Color(0.3f, 0.8f, 0.3f)
             : new Color(0.8f, 0.7f, 0.2f);
-        GUILayout.Label(status, _statusStyle);
-
-        GUILayout.Space(8);
-        GUILayout.EndVertical();
-        GUILayout.Space(14);
-        GUILayout.EndHorizontal();
     }
 
-    void HandleKeyboardInput()
-    {
-        if (Event.current.type != EventType.KeyDown) return;
-
-        if (Event.current.keyCode == KeyCode.Space &&
-            Event.current.shift &&
-            (Event.current.control || Event.current.command))
-        {
-            lastCloseTime = EditorApplication.timeSinceStartup;
-            Close();
-            Event.current.Use();
-            return;
-        }
-
-        switch (Event.current.keyCode)
-        {
-            case KeyCode.Tab:
-                NavigateSelection(Event.current.shift ? -1 : 1);
-                break;
-
-            case KeyCode.DownArrow:
-                NavigateSelection(1);
-                break;
-
-            case KeyCode.UpArrow:
-                NavigateSelection(-1);
-                break;
-
-            case KeyCode.Return:
-            case KeyCode.KeypadEnter:
-                if (selectedIndex >= 0 && selectedIndex < searchResults.Count)
-                {
-                    SelectResult(searchResults[selectedIndex]);
-                    Event.current.Use();
-                }
-                break;
-
-            case KeyCode.Escape:
-                Close();
-                Event.current.Use();
-                break;
-        }
-    }
-
-    void NavigateSelection(int direction)
-    {
-        Event.current.Use();
-        if (searchResults.Count == 0) return;
-        int next = selectedIndex + direction;
-        if (next < 0 || next >= searchResults.Count) return;
-        selectedIndex = next;
-        EnsureVisible();
-        PingSelectedResult();
-        Repaint();
-    }
-
-    void EnsureVisible()
-    {
-        float itemTop = selectedIndex * ItemHeight;
-        float itemBottom = itemTop + ItemHeight;
-        float viewHeight = position.height - (SearchAreaHeight + 13f) - FooterHeight;
-
-        if (itemBottom > scrollPosition.y + viewHeight)
-            scrollPosition.y = itemBottom - viewHeight;
-        else if (itemTop < scrollPosition.y)
-            scrollPosition.y = itemTop;
-    }
-
-    void PingSelectedResult()
-    {
-        if (selectedIndex >= 0 && selectedIndex < searchResults.Count)
-        {
-            var target = searchResults[selectedIndex].Target;
-            if (target != null)
-                EditorGUIUtility.PingObject(target);
-        }
-    }
-
-    void SelectResult(SearchResult result)
-    {
-        if (result.OnSelect != null)
-        {
-            result.OnSelect();
-        }
-        else if (result.Target != null)
-        {
-            Selection.activeObject = result.Target;
-            AssetDatabase.OpenAsset(result.Target);
-        }
-        Close();
-    }
+    // -------------------------------------------------------------------- window
 
     void ResizeWindow()
     {
-        float contentHeight = MinWindowHeight; // search bar area + padding
+        float contentHeight = MinWindowHeight;
 
         if (displaySettings)
         {
-            contentHeight += 400;
+            // Measure the real content once it has laid out, so the panel doesn't leave
+            // a slab of dead space below it.
+            float measured = settingsContent != null ? settingsContent.resolvedStyle.height : 0f;
+            float panelHeight = measured > 1f ? measured + SettingsPadding : SettingsHeight;
+            contentHeight += panelHeight + FooterHeight;
         }
         else if (searchResults.Count > 0)
         {
             int visibleCount = Mathf.Min(searchResults.Count, maxVisibleResults);
-            contentHeight += 5 + visibleCount * ItemHeight + FooterHeight;
+            contentHeight += ResultsPadding + visibleCount * RowHeight + FooterHeight;
         }
         else if (!string.IsNullOrEmpty(searchQuery))
         {
-            contentHeight += 50;
+            contentHeight += EmptyStateHeight;
         }
 
         float targetHeight = Mathf.Clamp(contentHeight, MinWindowHeight, MaxWindowHeight);
@@ -729,45 +941,118 @@ public class nSearch : EditorWindow
         maxSize = new Vector2(WindowWidth, targetHeight);
     }
 
-    void BuildFileIndex()
+    // ------------------------------------------------------------------- indexing
+
+    /// <summary>Marks the shared index for a rebuild the next time nSearch opens.</summary>
+    internal static void InvalidateIndex()
     {
-        fileIndex.Clear();
-        string[] allAssets = AssetDatabase.GetAllAssetPaths();
-        EditorApplication.update += IndexNextBatch;
-        indexIterator = ((IEnumerable<string>)allAssets).GetEnumerator();
+        indexStale = true;
     }
 
-    void IndexNextBatch()
+    /// <summary>
+    /// The index maps asset names to paths, so only added, deleted and moved assets can
+    /// invalidate it. Re-importing something already indexed - which is what saving a
+    /// script does - leaves it perfectly valid.
+    /// </summary>
+    internal static void NotifyAssetsChanged(string[] imported, string[] deleted, string[] moved, string[] movedFrom)
     {
-        int processed = 0;
-        int batchSize = 200;
-        bool hasMore = true;
+        if (indexStale)
+            return;
 
-        while (processed < batchSize && (hasMore = indexIterator.MoveNext()))
+        if (deleted.Length > 0 || moved.Length > 0 || movedFrom.Length > 0)
+        {
+            indexStale = true;
+            return;
+        }
+
+        for (int i = 0; i < imported.Length; i++)
+        {
+            if (!sharedIndex.ContainsPath(imported[i]))
+            {
+                indexStale = true;
+                return;
+            }
+        }
+    }
+
+    void EnsureIndex()
+    {
+        bool scopeChanged = indexIncludesPackages != includePackages;
+
+        if (!indexStale && !scopeChanged && (indexReady || indexBuilding))
+            return;
+
+        StartIndexBuild();
+    }
+
+    void StartIndexBuild()
+    {
+        // Safe whether or not a previous build is still running.
+        EditorApplication.update -= IndexNextBatch;
+
+        indexIncludesPackages = includePackages;
+        indexStale = false;
+        indexReady = false;
+        indexBuilding = true;
+
+        string[] allAssets = AssetDatabase.GetAllAssetPaths();
+        sharedIndex.Clear();
+        sharedIndex.Reserve(allAssets.Length);
+        indexIterator = ((IEnumerable<string>)allAssets).GetEnumerator();
+
+        EditorApplication.update += IndexNextBatch;
+    }
+
+    /// <summary>
+    /// Indexes on a time budget instead of a fixed item count, so a small project
+    /// finishes in one tick and a huge one still leaves the editor responsive.
+    /// </summary>
+    static void IndexNextBatch()
+    {
+        const double budgetSeconds = 0.006;
+        const int checkInterval = 512;
+
+        double deadline = EditorApplication.timeSinceStartup + budgetSeconds;
+        int sinceTimeCheck = 0;
+
+        while (indexIterator.MoveNext())
         {
             string path = indexIterator.Current;
-            if (path.StartsWith("Assets/") || (includePackages && path.StartsWith("Packages/")))
+
+            if (path.StartsWith("Assets/", StringComparison.Ordinal) ||
+                (indexIncludesPackages && path.StartsWith("Packages/", StringComparison.Ordinal)))
             {
-                string fileName = Path.GetFileNameWithoutExtension(path).ToLower();
-                fileIndex.Add(fileName, path);
+                sharedIndex.Add(Path.GetFileNameWithoutExtension(path).ToLowerInvariant(), path);
             }
-            processed++;
+
+            if (++sinceTimeCheck >= checkInterval)
+            {
+                sinceTimeCheck = 0;
+                if (EditorApplication.timeSinceStartup >= deadline)
+                    return; // Resume on the next editor tick.
+            }
         }
 
-        if (!hasMore)
-        {
-            EditorApplication.update -= IndexNextBatch;
-            indexIterator = null;
-            indexingComplete = true;
+        EditorApplication.update -= IndexNextBatch;
+        indexIterator = null;
+        indexBuilding = false;
+        indexReady = true;
 
-            if (!string.IsNullOrEmpty(searchQuery))
-                PerformSearch();
+        if (currentWindow != null && currentWindow.root != null)
+        {
+            currentWindow.RefreshStatusLabel();
+
+            if (!string.IsNullOrEmpty(currentWindow.searchQuery))
+                currentWindow.RunSearch();
         }
     }
+
+    // -------------------------------------------------------------------- search
 
     void PerformSearch()
     {
         searchResults.Clear();
+        highlightQuery = "";
 
         if (string.IsNullOrEmpty(searchQuery) || displaySettings)
             return;
@@ -777,14 +1062,16 @@ public class nSearch : EditorWindow
         {
             if (searchQuery.StartsWith(cmd.Prefix, StringComparison.OrdinalIgnoreCase))
             {
-                cmd.GetResults(searchQuery.Substring(cmd.Prefix.Length).Trim(), searchResults);
+                highlightQuery = searchQuery.Substring(cmd.Prefix.Length).Trim();
+                cmd.GetResults(highlightQuery, searchResults);
                 return;
             }
         }
 
         if (searchQuery.StartsWith("h:"))
         {
-            SearchHierarchy(searchQuery.Substring(2).Trim());
+            highlightQuery = searchQuery.Substring(2).Trim();
+            SearchHierarchy(highlightQuery);
             return;
         }
 
@@ -794,45 +1081,39 @@ public class nSearch : EditorWindow
             string mathResult = AdvancedMathEvaluator.EvaluateExpression(searchQuery);
             if (mathResult != null)
             {
+                string value = mathResult;
                 searchResults.Add(new SearchResult
                 {
                     Name = mathResult,
                     Path = "= " + searchQuery,
-                    Icon = EditorGUIUtility.IconContent("console.infoicon").image as Texture2D
+                    Icon = EditorGUIUtility.IconContent("console.infoicon").image as Texture2D,
+                    ActionLabel = "Copy",
+                    OnSelect = () => EditorGUIUtility.systemCopyBuffer = value
                 });
                 return;
             }
         }
 
-        // File search
-        var rankedResults = fileIndex.Search(searchQuery.ToLower());
+        highlightQuery = searchQuery;
+
+        // File search. Icons come from the asset database's cache and the object itself
+        // is loaded lazily, so a hundred hits cost a hundred dictionary lookups rather
+        // than a hundred asset loads.
+        var rankedResults = sharedIndex.Search(searchQuery.ToLowerInvariant());
 
         foreach (var path in rankedResults)
         {
-            var asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path);
-            if (asset != null)
+            Texture2D icon = AssetDatabase.GetCachedIcon(path) as Texture2D;
+            if (icon == null)
+                icon = FileUtilities.GetFileTypeIcon(path);
+
+            searchResults.Add(new SearchResult
             {
-                Texture2D icon = null;
-
-                if (path.EndsWith(".unity"))
-                {
-                    icon = FileUtilities.GetFileTypeIcon(path);
-                }
-                else
-                {
-                    icon = AssetPreview.GetMiniThumbnail(asset);
-                    if (icon == null)
-                        icon = FileUtilities.GetFileTypeIcon(path);
-                }
-
-                searchResults.Add(new SearchResult
-                {
-                    Name = Path.GetFileName(path),
-                    Path = path,
-                    Icon = icon,
-                    Target = asset
-                });
-            }
+                Name = Path.GetFileName(path),
+                Path = path,
+                Icon = icon,
+                AssetPath = path
+            });
         }
 
         // Also search hierarchy if enabled
@@ -842,24 +1123,50 @@ public class nSearch : EditorWindow
 
     void SearchHierarchy(string query)
     {
-        GameObject[] allObjects = UnityEngine.Object.FindObjectsOfType<GameObject>();
-        query = query.ToLower();
+        if (string.IsNullOrEmpty(query))
+            return;
 
-        foreach (GameObject go in allObjects)
+        // Cached between keystrokes and invalidated on hierarchy changes, so a big scene
+        // is walked once rather than re-collected for every character typed.
+        GameObject[] sceneObjects = HierarchySearcher.GetSceneObjects();
+        int added = 0;
+
+        for (int i = 0; i < sceneObjects.Length; i++)
         {
-            if (go.name.ToLower().Contains(query))
-            {
-                searchResults.Add(new SearchResult
-                {
-                    Name = go.name,
-                    Path = "Scene: " + go.scene.name,
-                    Icon = HierarchySearcher.GetHierarchyIcon(go),
-                    Target = go
-                });
+            GameObject go = sceneObjects[i];
 
-                if (searchResults.Count >= 50) break;
-            }
+            // The cache can outlive an object destroyed without a hierarchy event.
+            if (go == null)
+                continue;
+
+            if (go.name.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0)
+                continue;
+
+            searchResults.Add(new SearchResult
+            {
+                Name = go.name,
+                Path = "Scene: " + go.scene.name,
+                Icon = HierarchySearcher.GetHierarchyIcon(go),
+                Target = go
+            });
+
+            // Counted separately from file results, which would otherwise have already
+            // filled the list and starved hierarchy hits entirely.
+            if (++added >= 50)
+                break;
         }
     }
+}
 
+/// <summary>Keeps the shared nSearch asset index honest when the project changes.</summary>
+internal class nSearchIndexWatcher : AssetPostprocessor
+{
+    private static void OnPostprocessAllAssets(
+        string[] importedAssets,
+        string[] deletedAssets,
+        string[] movedAssets,
+        string[] movedFromAssetPaths)
+    {
+        nSearch.NotifyAssetsChanged(importedAssets, deletedAssets, movedAssets, movedFromAssetPaths);
+    }
 }

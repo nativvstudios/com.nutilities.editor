@@ -30,6 +30,7 @@ public class CreateCommand : ISearchCommand
                     Name = displayName,
                     Path = menuPath,
                     Icon = EditorGUIUtility.IconContent("d_CreateAddNew").image as Texture2D,
+                    ActionLabel = "Create",
                     OnSelect = () => EditorApplication.ExecuteMenuItem(path)
                 });
             }
