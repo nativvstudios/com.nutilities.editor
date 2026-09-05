@@ -4,855 +4,1002 @@ using System;
 using System.IO;
 using System.Collections.Generic;
 using UnityEditor.SceneManagement;
-using System.Linq;
-using UnityEditor.IMGUI.Controls;
+using UnityEngine.UIElements;
+using UnityEditor.UIElements;
 
 public class SceneOrganizerWindow : EditorWindow
 {
-    // Data
+    // ------------------------------------------------------------------ model
+
+    /// <summary>
+    /// Scene paths with their display strings precomputed, so no row has to derive them
+    /// while drawing.
+    /// </summary>
+    private struct SceneEntry
+    {
+        public string Path;
+        public string Name;
+        public string Directory;
+        public string LowerName;
+        public string LowerPath;
+    }
+
     private SceneGroupData sceneGroupData;
     private AssetNotesData assetNotesData;
-    private List<string> allScenes = new List<string>();
 
-    // Split View
-    private float splitViewPercent = 0.5f;
-    private bool isResizingSplitView = false;
+    private readonly List<SceneEntry> allScenes = new List<SceneEntry>();
+    private readonly Dictionary<string, int> sceneIndexByPath = new Dictionary<string, int>(StringComparer.Ordinal);
+    private readonly HashSet<string> knownScenePaths = new HashSet<string>(StringComparer.Ordinal);
 
-    // UI State
-    private Vector2 leftScrollPosition;
-    private Vector2 rightScrollPosition;
-
-    // Interaction State
-    private string selectedScene;
-    private int selectedGroupIndex = -1;
-    private string draggingScene;
-    private string targetGroup;
-    private float lastClickTime;
-
-    // Rename State
-    private string renamingScene;
-    private string renamingGroup;
-    private string renamingGroupText = ""; // Add this
-
-    // New Group State
-    private bool isCreatingNewGroup = false;
-    private string newGroupName = "";
+    // Indices into allScenes. Recomputed only when the query or the scene list changes.
+    private readonly List<int> filteredScenes = new List<int>();
+    private readonly List<int> recentScenes = new List<int>();
+    private string filterCacheKey;
 
     // Settings
     private string searchQuery = "";
     private bool showRecentScenes = true;
+    private bool showScenePath = false;
     private bool enableBackup;
     private string backupDirectory;
-
-    // View Options
-    private bool showScenePath = false;
+    private float leftPaneWidth = 300f;
     private SceneSortMode sortMode = SceneSortMode.Name;
-    private bool debugMode = false;
 
     private enum SceneSortMode { Name, Path, RecentlyUsed }
+
+    private const float RowHeight = 22f;
+    private const float DragThreshold = 6f;
+
+    // ------------------------------------------------------------------- view
+
+    private TwoPaneSplitView split;
+    private VisualElement leftPane;
+    private VisualElement rightPane;
+    private ListView sceneList;
+    private ListView recentList;
+    private Foldout recentFoldout;
+    private Label sceneCountLabel;
+    private VisualElement sceneEmpty;
+    private ScrollView groupsScroll;
+    private VisualElement groupsEmpty;
+    private ToolbarMenu sortMenu;
+
+    private IVisualElementScheduledItem pendingSave;
+    private const long SaveDebounceMs = 700;
+
+    private Vector2 dragStart;
+    private bool dragCandidate;
+    private string renamingGroup;
+
+    private static GUIContent sceneIconContent;
+    private const string DragKey = "nUtils.SceneOrganizer.Scenes";
 
     [MenuItem("Window/nUtilities/Scene Organizer")]
     public static void ShowWindow()
     {
         var window = GetWindow<SceneOrganizerWindow>("Scene Organizer");
-        window.minSize = new Vector2(600, 400);
+        window.minSize = new Vector2(560, 320);
     }
 
     private void OnEnable()
     {
-        LoadScenes();
+        // Groups and settings first: LoadScenes sorts by them and prunes against them.
         LoadGroups();
         LoadSettings();
         LoadAssetNotes();
+        LoadScenes();
+
+        EditorApplication.projectChanged += OnProjectChanged;
     }
 
     private void OnDisable()
     {
+        EditorApplication.projectChanged -= OnProjectChanged;
+        pendingSave?.Pause();
+
+        if (leftPane != null && leftPane.resolvedStyle.width > 50f)
+            leftPaneWidth = leftPane.resolvedStyle.width;
+
         SaveSettings();
         SaveGroups();
     }
 
-    private void LoadSettings()
+    private void OnProjectChanged()
     {
-        enableBackup = EditorPrefs.GetBool(SceneOrganizerConstants.PREF_ENABLE_BACKUP, false);
-        backupDirectory = EditorPrefs.GetString(SceneOrganizerConstants.PREF_BACKUP_DIR, Application.dataPath);
-        showRecentScenes = EditorPrefs.GetBool(SceneOrganizerConstants.PREF_SHOW_RECENT, true);
-        splitViewPercent = EditorPrefs.GetFloat("SceneOrganizer_SplitView", 0.5f);
-        showScenePath = EditorPrefs.GetBool("SceneOrganizer_ShowPath", false);
-        sortMode = (SceneSortMode)EditorPrefs.GetInt("SceneOrganizer_SortMode", 0);
+        // Saving our own asset raises this too. Rebuilding the group cards here would
+        // destroy the list you are dragging, so only react when scenes really changed.
+        if (!SceneSetChanged())
+            return;
+
+        LoadScenes();
+        RefreshAll();
     }
 
-    private void SaveSettings()
+    private bool SceneSetChanged()
     {
-        EditorPrefs.SetBool(SceneOrganizerConstants.PREF_SHOW_RECENT, showRecentScenes);
-        EditorPrefs.SetFloat("SceneOrganizer_SplitView", splitViewPercent);
-        EditorPrefs.SetBool("SceneOrganizer_ShowPath", showScenePath);
-        EditorPrefs.SetInt("SceneOrganizer_SortMode", (int)sortMode);
+        string[] guids = AssetDatabase.FindAssets("t:Scene");
+
+        if (guids.Length != knownScenePaths.Count)
+            return true;
+
+        foreach (string guid in guids)
+        {
+            if (!knownScenePaths.Contains(AssetDatabase.GUIDToAssetPath(guid)))
+                return true;
+        }
+
+        return false;
     }
 
-    public void LoadScenes()
+    /// <summary>
+    /// Marks the asset dirty now and schedules the actual write. AssetDatabase.SaveAssets
+    /// puts up Unity's save/import progress dialog, so calling it on every reorder step
+    /// flashed a popup on each drag.
+    /// </summary>
+    private void MarkGroupsDirty()
     {
-        allScenes.Clear();
-        string[] sceneGUIDs = AssetDatabase.FindAssets("t:Scene");
-        foreach (string guid in sceneGUIDs)
+        if (sceneGroupData == null)
+            return;
+
+        EditorUtility.SetDirty(sceneGroupData);
+
+        if (rootVisualElement == null)
         {
-            allScenes.Add(AssetDatabase.GUIDToAssetPath(guid));
-        }
-        SortScenes();
-        Repaint();
-    }
-
-    private void SortScenes()
-    {
-        switch (sortMode)
-        {
-            case SceneSortMode.Name:
-                allScenes.Sort((a, b) => Path.GetFileNameWithoutExtension(a).CompareTo(Path.GetFileNameWithoutExtension(b)));
-                break;
-            case SceneSortMode.Path:
-                allScenes.Sort();
-                break;
-            case SceneSortMode.RecentlyUsed:
-                if (sceneGroupData != null)
-                {
-                    allScenes = allScenes.OrderByDescending(s =>
-                        sceneGroupData.recentScenes.IndexOf(s)).ToList();
-                }
-                break;
-        }
-    }
-
-    private SceneGroupData GetSceneGroupData()
-    {
-        return sceneGroupData;
-    }
-
-    private void LoadAssetNotes()
-    {
-        string assetPath = "Assets/Editor/AssetNotesData.asset";
-        assetNotesData = AssetDatabase.LoadAssetAtPath<AssetNotesData>(assetPath);
-
-        if (assetNotesData == null)
-        {
-            assetNotesData = CreateInstance<AssetNotesData>();
-            AssetDatabase.CreateAsset(assetNotesData, assetPath);
-            AssetDatabase.SaveAssets();
-            Debug.Log("[Scene Organizer] Created AssetNotesData at " + assetPath);
-        }
-        else
-        {
-            Debug.Log($"[Scene Organizer] Loaded AssetNotesData with {assetNotesData.GetNoteCount()} note(s)");
-        }
-    }
-
-    private void OnGUI()
-    {
-        DrawToolbar();
-
-        Rect contentRect = new Rect(0, EditorGUIUtility.singleLineHeight + 4,
-            position.width, position.height - EditorGUIUtility.singleLineHeight - 4);
-
-        DrawSplitView(contentRect);
-
-        HandleKeyboardShortcuts();
-        HandleDragAndDrop();
-    }
-
-    #region Toolbar
-    private void DrawToolbar()
-    {
-        EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
-
-        // Scene controls
-        if (GUILayout.Button("Create Scene", EditorStyles.toolbarButton))
-        {
-            CreateNewSceneWindow.ShowWindow(this);
-        }
-
-        if (GUILayout.Button("Refresh", EditorStyles.toolbarButton))
-        {
-            LoadScenes();
-        }
-
-        GUILayout.Space(10);
-
-        // Search
-        GUILayout.Label("Search:", GUILayout.Width(50));
-        searchQuery = GUILayout.TextField(searchQuery, EditorStyles.toolbarSearchField, GUILayout.Width(200));
-
-        GUILayout.FlexibleSpace();
-
-        // View options
-        if (GUILayout.Button("Sort: " + sortMode.ToString(), EditorStyles.toolbarDropDown, GUILayout.Width(120)))
-        {
-            GenericMenu menu = new GenericMenu();
-            menu.AddItem(new GUIContent("Name"), sortMode == SceneSortMode.Name, () => { sortMode = SceneSortMode.Name; SortScenes(); });
-            menu.AddItem(new GUIContent("Path"), sortMode == SceneSortMode.Path, () => { sortMode = SceneSortMode.Path; SortScenes(); });
-            menu.AddItem(new GUIContent("Recently Used"), sortMode == SceneSortMode.RecentlyUsed, () => { sortMode = SceneSortMode.RecentlyUsed; SortScenes(); });
-            menu.ShowAsContext();
-        }
-
-        showScenePath = GUILayout.Toggle(showScenePath, "Show Path", EditorStyles.toolbarButton);
-        debugMode = GUILayout.Toggle(debugMode, "Debug", EditorStyles.toolbarButton);
-
-        GUILayout.Space(5);
-
-        if (GUILayout.Button(EditorGUIUtility.IconContent("_Menu"), EditorStyles.toolbarButton))
-        {
-            ShowOptionsMenu();
-        }
-
-        EditorGUILayout.EndHorizontal();
-    }
-
-    private void ShowOptionsMenu()
-    {
-        GenericMenu menu = new GenericMenu();
-
-        menu.AddItem(new GUIContent("Show Recent Scenes"), showRecentScenes, () => { showRecentScenes = !showRecentScenes; });
-        menu.AddSeparator("");
-        menu.AddItem(new GUIContent("Settings"), false, () => SettingsWindow.ShowWindow(this));
-
-        menu.ShowAsContext();
-    }
-    #endregion
-
-    #region Split View
-    private void DrawSplitView(Rect rect)
-    {
-        float splitX = rect.width * splitViewPercent;
-
-        // Left panel (Scenes)
-        Rect leftRect = new Rect(rect.x, rect.y, splitX - 2, rect.height);
-        DrawLeftPanel(leftRect);
-
-        // Splitter
-        Rect splitterRect = new Rect(rect.x + splitX - 2, rect.y, 4, rect.height);
-        DrawSplitter(splitterRect);
-
-        // Right panel (Groups)
-        Rect rightRect = new Rect(rect.x + splitX + 2, rect.y, rect.width - splitX - 2, rect.height);
-        DrawRightPanel(rightRect);
-    }
-
-    private void DrawSplitter(Rect rect)
-    {
-        EditorGUIUtility.AddCursorRect(rect, MouseCursor.ResizeHorizontal);
-
-        if (Event.current.type == EventType.MouseDown && rect.Contains(Event.current.mousePosition))
-        {
-            isResizingSplitView = true;
-            Event.current.Use();
-        }
-
-        if (isResizingSplitView)
-        {
-            splitViewPercent = Mathf.Clamp(Event.current.mousePosition.x / position.width, 0.2f, 0.8f);
-            Repaint();
-        }
-
-        if (Event.current.type == EventType.MouseUp)
-        {
-            isResizingSplitView = false;
-        }
-
-        // Draw splitter line
-        EditorGUI.DrawRect(new Rect(rect.x + 1, rect.y, 2, rect.height), new Color(0.1f, 0.1f, 0.1f, 0.5f));
-    }
-    #endregion
-
-    #region Left Panel - Scenes Browser
-    private void DrawLeftPanel(Rect rect)
-    {
-        GUILayout.BeginArea(rect);
-
-        // Header
-        Rect headerRect = new Rect(0, 0, rect.width, 22);
-        GUI.Box(headerRect, GUIContent.none, EditorStyles.toolbar);
-        GUI.Label(new Rect(5, 2, rect.width - 10, 18), "Scenes", EditorStyles.boldLabel);
-
-        // Content area
-        Rect contentRect = new Rect(0, 22, rect.width, rect.height - 22);
-        GUILayout.BeginArea(contentRect);
-
-        leftScrollPosition = EditorGUILayout.BeginScrollView(leftScrollPosition);
-
-        if (showRecentScenes && sceneGroupData != null)
-        {
-            DrawRecentScenesList();
-        }
-
-        DrawScenesList();
-
-        EditorGUILayout.EndScrollView();
-        GUILayout.EndArea();
-
-        GUILayout.EndArea();
-    }
-
-    private void DrawRecentScenesList()
-    {
-        if (sceneGroupData.recentScenes.Count == 0) return;
-
-        sceneGroupData.recentScenes.RemoveAll(s => !File.Exists(s));
-        if (sceneGroupData.recentScenes.Count == 0) return;
-
-        EditorGUILayout.LabelField("Recent", EditorStyles.boldLabel);
-        EditorGUI.indentLevel++;
-
-        for (int i = 0; i < Mathf.Min(5, sceneGroupData.recentScenes.Count); i++)
-        {
-            DrawSceneItem(sceneGroupData.recentScenes[i], true);
-        }
-
-        EditorGUI.indentLevel--;
-        GUILayout.Space(5);
-        DrawHorizontalLine();
-        GUILayout.Space(5);
-    }
-
-    private void DrawScenesList()
-    {
-        var filteredScenes = GetFilteredScenes();
-
-        if (filteredScenes.Count == 0)
-        {
-            EditorGUILayout.HelpBox("No scenes found", MessageType.Info);
+            SaveGroups();
             return;
         }
 
-        EditorGUILayout.LabelField($"All Scenes ({filteredScenes.Count})", EditorStyles.boldLabel);
-        EditorGUI.indentLevel++;
+        if (pendingSave == null)
+            pendingSave = rootVisualElement.schedule.Execute(SaveGroups);
 
-        foreach (string scene in filteredScenes)
-        {
-            DrawSceneItem(scene, false);
-        }
-
-        EditorGUI.indentLevel--;
+        pendingSave.ExecuteLater(SaveDebounceMs);
     }
 
-    private void DrawSceneItem(string scenePath, bool isRecent)
+    // ------------------------------------------------------------- UI assembly
+
+    private void CreateGUI()
     {
-        if (scenePath == renamingScene)
-        {
-            DrawRenamingSceneField(scenePath);
-            return;
-        }
+        var root = rootVisualElement;
+        root.AddToClassList("so-root");
 
-        bool isSelected = scenePath == selectedScene;
-        string sceneName = Path.GetFileNameWithoutExtension(scenePath);
+        var sheet = LoadStyleSheet();
+        if (sheet != null)
+            root.styleSheets.Add(sheet);
 
-        Rect rect = GUILayoutUtility.GetRect(GUIContent.none, EditorStyles.label, GUILayout.Height(18));
+        root.Add(BuildToolbar());
 
-        // Handle selection
-        if (Event.current.type == EventType.MouseDown && rect.Contains(Event.current.mousePosition))
-        {
-            if (Event.current.button == 0) // Left click
-            {
-                if (selectedScene == scenePath &&
-                    (EditorApplication.timeSinceStartup - lastClickTime) < 0.3f)
-                {
-                    // Double click - open scene
-                    OpenScene(scenePath);
-                }
-                else
-                {
-                    selectedScene = scenePath;
-                    selectedGroupIndex = -1;
-                    lastClickTime = (float)EditorApplication.timeSinceStartup;
-                }
-                Event.current.Use();
-                Repaint();
-            }
-            else if (Event.current.button == 1) // Right click
-            {
-                selectedScene = scenePath;
-                ShowSceneContextMenu(scenePath);
-                Event.current.Use();
-            }
-        }
+        split = new TwoPaneSplitView(0, leftPaneWidth, TwoPaneSplitViewOrientation.Horizontal);
+        root.Add(split);
 
-        // Draw selection highlight
-        if (isSelected)
-        {
-            EditorGUI.DrawRect(rect, new Color(0.24f, 0.48f, 0.90f, 0.5f));
-        }
-        else if (rect.Contains(Event.current.mousePosition))
-        {
-            EditorGUI.DrawRect(rect, new Color(1f, 1f, 1f, 0.1f));
-        }
+        leftPane = BuildScenePane();
+        rightPane = BuildGroupPane();
+        split.Add(leftPane);
+        split.Add(rightPane);
 
-        // Draw icon and label
-        Rect iconRect = new Rect(rect.x, rect.y, 16, 16);
-        float labelX = rect.x + 18;
+        root.RegisterCallback<KeyDownEvent>(OnKeyDown);
 
-        GUI.DrawTexture(iconRect, EditorGUIUtility.IconContent("SceneAsset Icon").image);
-
-        // Note indicator
-        if (assetNotesData != null && assetNotesData.HasNote(scenePath))
-        {
-            Rect noteRect = new Rect(labelX, rect.y, 16, 16);
-            GUI.Label(noteRect, new GUIContent("📝", assetNotesData.GetNote(scenePath)));
-            labelX += 18;
-        }
-
-        Rect labelRect = new Rect(labelX, rect.y, rect.width - (labelX - rect.x), rect.height);
-
-        GUIStyle labelStyle = new GUIStyle(EditorStyles.label);
-        if (isRecent)
-        {
-            labelStyle.normal.textColor = new Color(0.6f, 0.8f, 1f);
-        }
-
-        GUI.Label(labelRect, sceneName, labelStyle);
-
-        if (showScenePath)
-        {
-            Rect pathRect = new Rect(rect.x + 18, rect.y, rect.width - 18, rect.height);
-            GUI.Label(pathRect, Path.GetDirectoryName(scenePath), EditorStyles.miniLabel);
-        }
-
-        // Handle drag start
-        if (Event.current.type == EventType.MouseDrag && isSelected && rect.Contains(Event.current.mousePosition))
-        {
-            DragAndDrop.PrepareStartDrag();
-            DragAndDrop.paths = new string[] { scenePath };
-            DragAndDrop.objectReferences = new UnityEngine.Object[] { AssetDatabase.LoadAssetAtPath<SceneAsset>(scenePath) };
-            DragAndDrop.StartDrag(sceneName);
-            draggingScene = scenePath;
-            Event.current.Use();
-        }
+        RefreshAll();
     }
 
-    private void DrawRenamingSceneField(string scenePath)
+    private StyleSheet LoadStyleSheet()
     {
-        EditorGUILayout.BeginHorizontal();
-        EditorGUI.indentLevel--;
+        // Resolved next to this script so the package can be moved or renamed freely.
+        var script = MonoScript.FromScriptableObject(this);
+        string scriptPath = script != null ? AssetDatabase.GetAssetPath(script) : null;
 
-        GUI.SetNextControlName("SceneRenameField");
-        string newName = EditorGUILayout.TextField(Path.GetFileNameWithoutExtension(scenePath));
-
-        if (GUILayout.Button("", EditorStyles.label, GUILayout.Width(0), GUILayout.Height(0)))
+        if (!string.IsNullOrEmpty(scriptPath))
         {
-            GUI.FocusControl("SceneRenameField");
-        }
+            string dir = Path.GetDirectoryName(scriptPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                var sheet = AssetDatabase.LoadAssetAtPath<StyleSheet>(
+                    dir.Replace('\\', '/') + "/SceneOrganizerStyles.uss");
 
-        if (Event.current.isKey && GUI.GetNameOfFocusedControl() == "SceneRenameField")
-        {
-            if (Event.current.keyCode == KeyCode.Return || Event.current.keyCode == KeyCode.KeypadEnter)
-            {
-                RenameScene(scenePath, newName);
-                renamingScene = null;
-                Event.current.Use();
-            }
-            else if (Event.current.keyCode == KeyCode.Escape)
-            {
-                renamingScene = null;
-                Event.current.Use();
+                if (sheet != null)
+                    return sheet;
             }
         }
 
-        EditorGUI.indentLevel++;
-        EditorGUILayout.EndHorizontal();
+        Debug.LogWarning("[Scene Organizer] SceneOrganizerStyles.uss not found next to SceneOrganizerWindow.cs; the window will render unstyled.");
+        return null;
     }
 
-    private void ShowSceneContextMenu(string scenePath)
+    private Toolbar BuildToolbar()
     {
-        GenericMenu menu = new GenericMenu();
+        var toolbar = new Toolbar();
 
-        menu.AddItem(new GUIContent("Open"), false, () => OpenScene(scenePath));
-        menu.AddItem(new GUIContent("Open Additive"), false, () =>
-            EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Additive));
-        menu.AddSeparator("");
+        var create = new ToolbarButton(() => CreateNewSceneWindow.ShowWindow(this)) { text = "Create Scene" };
+        toolbar.Add(create);
 
-        menu.AddItem(new GUIContent("Edit Note"), false, () =>
+        var refresh = new ToolbarButton(() => { LoadScenes(); RefreshAll(); }) { text = "Refresh" };
+        toolbar.Add(refresh);
+
+        var search = new ToolbarSearchField();
+        search.AddToClassList("so-search");
+        search.tooltip = "Filter scenes by name or path";
+        search.RegisterValueChangedCallback(evt =>
         {
-            SceneNoteEditorWindow.ShowWindow(scenePath, assetNotesData, this);
+            searchQuery = evt.newValue ?? "";
+            InvalidateFilter();
+            RefreshSceneList();
         });
-        menu.AddSeparator("");
+        toolbar.Add(search);
 
-        if (sceneGroupData != null && sceneGroupData.sceneGroups.Count > 0)
+        var spacer = new VisualElement();
+        spacer.AddToClassList("so-toolbar-spacer");
+        toolbar.Add(spacer);
+
+        sortMenu = new ToolbarMenu { text = "Sort: " + sortMode };
+        foreach (SceneSortMode mode in Enum.GetValues(typeof(SceneSortMode)))
         {
-            foreach (var group in sceneGroupData.sceneGroups)
+            var captured = mode;
+            sortMenu.menu.AppendAction(
+                ObjectNames.NicifyVariableName(mode.ToString()),
+                _ => SetSortMode(captured),
+                _ => sortMode == captured ? DropdownMenuAction.Status.Checked : DropdownMenuAction.Status.Normal);
+        }
+        toolbar.Add(sortMenu);
+
+        var pathToggle = new ToolbarToggle { text = "Path", value = showScenePath, tooltip = "Show each scene's folder" };
+        pathToggle.RegisterValueChangedCallback(evt =>
+        {
+            showScenePath = evt.newValue;
+            SaveSettings();
+            RefreshSceneList();
+        });
+        toolbar.Add(pathToggle);
+
+        var options = new ToolbarMenu { text = "⋮" };
+        options.menu.AppendAction("Show Recent Scenes",
+            _ => { showRecentScenes = !showRecentScenes; SaveSettings(); RefreshSceneList(); },
+            _ => showRecentScenes ? DropdownMenuAction.Status.Checked : DropdownMenuAction.Status.Normal);
+        options.menu.AppendSeparator();
+        options.menu.AppendAction("Settings…", _ => SettingsWindow.ShowWindow(this));
+        toolbar.Add(options);
+
+        return toolbar;
+    }
+
+    private VisualElement BuildScenePane()
+    {
+        var pane = new VisualElement();
+        pane.AddToClassList("so-pane");
+
+        var header = new VisualElement();
+        header.AddToClassList("so-pane__header");
+
+        var title = new Label("Scenes");
+        title.AddToClassList("so-pane__title");
+        header.Add(title);
+
+        sceneCountLabel = new Label();
+        sceneCountLabel.AddToClassList("so-pane__count");
+        header.Add(sceneCountLabel);
+
+        pane.Add(header);
+
+        var body = new VisualElement();
+        body.AddToClassList("so-pane__body");
+
+        recentFoldout = new Foldout { text = "Recent", value = true };
+        recentFoldout.AddToClassList("so-recent");
+        recentList = MakeSceneListView(recentScenes, true);
+        recentFoldout.Add(recentList);
+        body.Add(recentFoldout);
+
+        sceneList = MakeSceneListView(filteredScenes, false);
+        sceneList.style.flexGrow = 1;
+        body.Add(sceneList);
+
+        sceneEmpty = BuildEmptyState("No scenes match", "Try a different search term.", null, null);
+        body.Add(sceneEmpty);
+
+        pane.Add(body);
+        return pane;
+    }
+
+    private ListView MakeSceneListView(List<int> source, bool isRecent)
+    {
+        var list = new ListView
+        {
+            itemsSource = source,
+            fixedItemHeight = RowHeight,
+            selectionType = isRecent ? SelectionType.Single : SelectionType.Multiple,
+            virtualizationMethod = CollectionVirtualizationMethod.FixedHeight,
+            showBorder = false,
+            makeItem = () => MakeSceneRow(isRecent),
+            reorderable = false,
+        };
+
+        list.bindItem = (element, index) => BindSceneRow(element, source, index, isRecent);
+
+        // Double-click (or Enter on the list) opens.
+        list.itemsChosen += chosen =>
+        {
+            foreach (var item in chosen)
             {
-                bool inGroup = group.scenes.Contains(scenePath);
-                menu.AddItem(new GUIContent("Add to Group/" + group.groupName), inGroup,
-                    () => AddSceneToGroup(scenePath, group.groupName));
+                if (item is int sceneIndex && sceneIndex >= 0 && sceneIndex < allScenes.Count)
+                {
+                    OpenScene(allScenes[sceneIndex].Path);
+                    break;
+                }
             }
-            menu.AddSeparator("");
-        }
+        };
 
-        menu.AddItem(new GUIContent("Rename"), false, () => { renamingScene = scenePath; Repaint(); });
-        menu.AddItem(new GUIContent("Show in Project"), false, () =>
-            EditorGUIUtility.PingObject(AssetDatabase.LoadAssetAtPath<SceneAsset>(scenePath)));
-        menu.AddSeparator("");
-        menu.AddItem(new GUIContent("Copy Path"), false, () => EditorGUIUtility.systemCopyBuffer = scenePath);
-
-        menu.ShowAsContext();
+        return list;
     }
 
-    private List<string> GetFilteredScenes()
+    private VisualElement MakeSceneRow(bool isRecent)
     {
-        if (string.IsNullOrEmpty(searchQuery))
-            return allScenes;
+        var row = new VisualElement();
+        row.AddToClassList("so-row");
+        if (isRecent)
+            row.AddToClassList("so-row--recent");
 
-        return allScenes.Where(s =>
-            Path.GetFileNameWithoutExtension(s).ToLower().Contains(searchQuery.ToLower()) ||
-            s.ToLower().Contains(searchQuery.ToLower())
-        ).ToList();
-    }
-    #endregion
+        var icon = new Image { name = "icon", scaleMode = ScaleMode.ScaleToFit };
+        icon.AddToClassList("so-row__icon");
+        row.Add(icon);
 
-    #region Right Panel - Groups
-    private void DrawRightPanel(Rect rect)
-    {
-        GUILayout.BeginArea(rect);
+        var name = new Label { name = "name" };
+        name.AddToClassList("so-row__name");
+        row.Add(name);
 
-        // Header
-        Rect headerRect = new Rect(0, 0, rect.width, 22);
-        GUI.Box(headerRect, GUIContent.none, EditorStyles.toolbar);
+        var note = new Label { name = "note", text = "\U0001F4DD" };
+        note.AddToClassList("so-row__note");
+        row.Add(note);
 
-        Rect headerLabelRect = new Rect(5, 2, rect.width - 50, 18);
-        GUI.Label(headerLabelRect, "Groups", EditorStyles.boldLabel);
+        var spacer = new VisualElement();
+        spacer.AddToClassList("so-row__spacer");
+        row.Add(spacer);
 
-        Rect addButtonRect = new Rect(rect.width - 45, 2, 40, 18);
-        if (GUI.Button(addButtonRect, "New", EditorStyles.toolbarButton))
+        var path = new Label { name = "path" };
+        path.AddToClassList("so-row__path");
+        row.Add(path);
+
+        // Drag out to a group. A plain click must not start one, hence the threshold.
+        row.RegisterCallback<PointerDownEvent>(evt =>
         {
-            StartCreatingNewGroup();
-        }
+            if (evt.button != 0) return;
+            dragStart = evt.position;
+            dragCandidate = true;
+        });
 
-        // Content area
-        Rect contentRect = new Rect(0, 22, rect.width, rect.height - 22);
-        GUILayout.BeginArea(contentRect);
-
-        if (sceneGroupData == null || (sceneGroupData.sceneGroups.Count == 0 && !isCreatingNewGroup))
+        row.RegisterCallback<PointerMoveEvent>(evt =>
         {
-            DrawEmptyGroupsState();
-        }
-        else
+            if (!dragCandidate || (evt.pressedButtons & 1) == 0) return;
+            if (Vector2.Distance(evt.position, dragStart) < DragThreshold) return;
+
+            dragCandidate = false;
+            StartSceneDrag();
+        });
+
+        row.RegisterCallback<PointerUpEvent>(_ => dragCandidate = false);
+
+        row.AddManipulator(new ContextualMenuManipulator(evt =>
         {
-            DrawGroupsList();
-        }
+            if (!(row.userData is int sceneIndex) || sceneIndex < 0 || sceneIndex >= allScenes.Count)
+                return;
 
-        GUILayout.EndArea();
-        GUILayout.EndArea();
-    }
+            BuildSceneContextMenu(evt.menu, allScenes[sceneIndex].Path);
+        }));
 
-    private void DrawEmptyGroupsState()
-    {
-        GUILayout.FlexibleSpace();
-
-        EditorGUILayout.BeginHorizontal();
-        GUILayout.FlexibleSpace();
-        EditorGUILayout.BeginVertical();
-
-        GUILayout.Label("No groups created yet", EditorStyles.centeredGreyMiniLabel);
-        GUILayout.Space(10);
-        if (GUILayout.Button("Create First Group", GUILayout.Width(150)))
-        {
-            StartCreatingNewGroup();
-        }
-
-        EditorGUILayout.EndVertical();
-        GUILayout.FlexibleSpace();
-        EditorGUILayout.EndHorizontal();
-
-        GUILayout.FlexibleSpace();
+        return row;
     }
 
-    private void DrawGroupsList()
+    private void BindSceneRow(VisualElement element, List<int> source, int index, bool isRecent)
     {
-        rightScrollPosition = EditorGUILayout.BeginScrollView(rightScrollPosition);
+        if (index < 0 || index >= source.Count)
+            return;
 
-        // Draw new group creation field at the top if active
-        if (isCreatingNewGroup)
+        int sceneIndex = source[index];
+        if (sceneIndex < 0 || sceneIndex >= allScenes.Count)
+            return;
+
+        SceneEntry entry = allScenes[sceneIndex];
+        element.userData = sceneIndex;
+
+        var icon = element.Q<Image>("icon");
+        if (sceneIconContent != null)
+            icon.image = sceneIconContent.image;
+
+        element.Q<Label>("name").text = entry.Name;
+
+        var note = element.Q<Label>("note");
+        bool hasNote = assetNotesData != null && assetNotesData.HasNote(entry.Path);
+        note.style.display = hasNote ? DisplayStyle.Flex : DisplayStyle.None;
+        note.tooltip = hasNote ? assetNotesData.GetNote(entry.Path) : null;
+
+        var path = element.Q<Label>("path");
+        path.style.display = showScenePath ? DisplayStyle.Flex : DisplayStyle.None;
+        path.text = showScenePath ? entry.Directory : null;
+
+        element.tooltip = entry.Path;
+    }
+
+    private VisualElement BuildGroupPane()
+    {
+        var pane = new VisualElement();
+        pane.AddToClassList("so-pane");
+
+        var header = new VisualElement();
+        header.AddToClassList("so-pane__header");
+
+        var title = new Label("Groups");
+        title.AddToClassList("so-pane__title");
+        header.Add(title);
+
+        var count = new Label();
+        count.AddToClassList("so-pane__count");
+        header.Add(count);
+
+        var newGroup = new Button(PromptNewGroup) { text = "New Group" };
+        newGroup.AddToClassList("so-btn");
+        header.Add(newGroup);
+
+        pane.Add(header);
+
+        var body = new VisualElement();
+        body.AddToClassList("so-pane__body");
+
+        groupsScroll = new ScrollView(ScrollViewMode.Vertical);
+        groupsScroll.AddToClassList("so-groups");
+        body.Add(groupsScroll);
+
+        groupsEmpty = BuildEmptyState(
+            "No groups yet",
+            "Group scenes you open together, then load the whole set in one click.",
+            "Create First Group",
+            PromptNewGroup);
+        body.Add(groupsEmpty);
+
+        pane.Add(body);
+        return pane;
+    }
+
+    private static VisualElement BuildEmptyState(string title, string hint, string actionText, Action action)
+    {
+        var empty = new VisualElement();
+        empty.AddToClassList("so-empty");
+
+        var titleLabel = new Label(title);
+        titleLabel.AddToClassList("so-empty__title");
+        empty.Add(titleLabel);
+
+        var hintLabel = new Label(hint);
+        hintLabel.AddToClassList("so-empty__hint");
+        empty.Add(hintLabel);
+
+        if (!string.IsNullOrEmpty(actionText) && action != null)
         {
-            DrawNewGroupCreationField();
-            GUILayout.Space(5);
+            var button = new Button(action) { text = actionText };
+            button.AddToClassList("so-empty__action");
+            empty.Add(button);
         }
+
+        return empty;
+    }
+
+    // -------------------------------------------------------------- refreshing
+
+    private void RefreshAll()
+    {
+        RefreshSceneList();
+        RefreshGroups();
+    }
+
+    private void RefreshSceneList()
+    {
+        if (sceneList == null)
+            return;
+
+        EnsureSceneIcon();
+        RebuildFilter();
+        RebuildRecents();
+
+        bool hasRecents = showRecentScenes && recentScenes.Count > 0;
+        recentFoldout.style.display = hasRecents ? DisplayStyle.Flex : DisplayStyle.None;
+        if (hasRecents)
+        {
+            recentList.style.height = recentScenes.Count * RowHeight + 4f;
+            recentList.RefreshItems();
+        }
+
+        bool any = filteredScenes.Count > 0;
+        sceneList.style.display = any ? DisplayStyle.Flex : DisplayStyle.None;
+        sceneEmpty.style.display = any ? DisplayStyle.None : DisplayStyle.Flex;
+
+        sceneCountLabel.text = string.IsNullOrEmpty(searchQuery)
+            ? allScenes.Count.ToString()
+            : filteredScenes.Count + " of " + allScenes.Count;
+
+        sceneList.RefreshItems();
+    }
+
+    private void RefreshGroups()
+    {
+        if (groupsScroll == null)
+            return;
+
+        groupsScroll.Clear();
+
+        bool any = sceneGroupData != null && sceneGroupData.sceneGroups.Count > 0;
+        groupsScroll.style.display = any ? DisplayStyle.Flex : DisplayStyle.None;
+        groupsEmpty.style.display = any ? DisplayStyle.None : DisplayStyle.Flex;
+
+        if (!any)
+            return;
 
         for (int i = 0; i < sceneGroupData.sceneGroups.Count; i++)
-        {
-            DrawGroupItem(sceneGroupData.sceneGroups[i], i);
-            GUILayout.Space(2);
-        }
-
-        EditorGUILayout.EndScrollView();
-
-        // Handle drop area for drag and drop
-        HandleGroupsDragAndDrop();
+            groupsScroll.Add(BuildGroupCard(sceneGroupData.sceneGroups[i], i));
     }
 
-    private void StartCreatingNewGroup()
+    private VisualElement BuildGroupCard(SceneGroupData.SceneGroup group, int groupIndex)
     {
-        isCreatingNewGroup = true;
-        newGroupName = "";
-        Repaint();
-    }
+        var card = new VisualElement();
+        card.AddToClassList("so-group");
 
-    private void DrawNewGroupCreationField()
-    {
-        EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-        EditorGUILayout.LabelField("New Group", EditorStyles.boldLabel);
+        var stripe = new VisualElement();
+        stripe.AddToClassList("so-group__stripe");
+        stripe.style.backgroundColor = group.groupColor;
+        card.Add(stripe);
 
-        EditorGUILayout.BeginHorizontal();
+        var main = new VisualElement();
+        main.AddToClassList("so-group__main");
+        card.Add(main);
 
-        GUI.SetNextControlName("NewGroupField");
-        newGroupName = EditorGUILayout.TextField(newGroupName);
+        var header = new VisualElement();
+        header.AddToClassList("so-group__header");
+        main.Add(header);
 
-        // Auto-focus the field when it first appears
-        if (Event.current.type == EventType.Repaint && string.IsNullOrEmpty(newGroupName))
+        // Assigned further down; the foldout callback closes over it.
+        VisualElement body = null;
+
+        var foldout = new Foldout { value = !group.isCollapsed };
+        foldout.AddToClassList("so-group__foldout");
+        foldout.RegisterValueChangedCallback(evt =>
         {
-            EditorGUI.FocusTextInControl("NewGroupField");
-        }
+            if (evt.target != foldout)
+                return;
 
-        GUI.enabled = !string.IsNullOrWhiteSpace(newGroupName);
-        if (GUILayout.Button("Create", EditorStyles.miniButton, GUILayout.Width(60)))
-        {
-            CreateNewGroup(newGroupName);
-            isCreatingNewGroup = false;
-            newGroupName = "";
-            GUI.FocusControl(null);
-        }
-        GUI.enabled = true;
+            group.isCollapsed = !evt.newValue;
+            EditorUtility.SetDirty(sceneGroupData);
 
-        if (GUILayout.Button("Cancel", EditorStyles.miniButton, GUILayout.Width(60)))
-        {
-            isCreatingNewGroup = false;
-            newGroupName = "";
-            GUI.FocusControl(null);
-        }
+            // The body is a sibling of the header, not a child of the foldout, so its
+            // visibility has to be driven explicitly - otherwise the arrow turns and
+            // nothing collapses.
+            if (body != null)
+                body.style.display = group.isCollapsed ? DisplayStyle.None : DisplayStyle.Flex;
+        });
+        header.Add(foldout);
 
-        EditorGUILayout.EndHorizontal();
+        var swatch = new VisualElement { tooltip = "Change group colour" };
+        swatch.AddToClassList("so-swatch");
+        swatch.style.backgroundColor = group.groupColor;
+        swatch.AddManipulator(new Clickable(() => ColorPickerWindow.ShowWindow(group, this)));
+        header.Add(swatch);
 
-        // Handle keyboard shortcuts
-        if (Event.current.isKey && GUI.GetNameOfFocusedControl() == "NewGroupField")
-        {
-            if (Event.current.keyCode == KeyCode.Return || Event.current.keyCode == KeyCode.KeypadEnter)
-            {
-                if (!string.IsNullOrWhiteSpace(newGroupName))
-                {
-                    CreateNewGroup(newGroupName);
-                    isCreatingNewGroup = false;
-                    newGroupName = "";
-                    Event.current.Use();
-                }
-            }
-            else if (Event.current.keyCode == KeyCode.Escape)
-            {
-                isCreatingNewGroup = false;
-                newGroupName = "";
-                Event.current.Use();
-            }
-        }
-
-        EditorGUILayout.EndVertical();
-    }
-
-    private void DrawGroupItem(SceneGroupData.SceneGroup group, int index)
-    {
-        bool isSelected = selectedGroupIndex == index;
-
-        // Container with color stripe
-        EditorGUILayout.BeginHorizontal(GUILayout.ExpandHeight(false));
-
-        // Color stripe on the left (fixed height, no expansion)
-        Rect stripeRect = GUILayoutUtility.GetRect(4, 20, GUILayout.Width(4));
-
-        EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-
-        // Group header
-        Rect headerRect = EditorGUILayout.BeginHorizontal(GUILayout.Height(20));
-
-        // Foldout
-        bool newCollapsed = !EditorGUILayout.Foldout(!group.isCollapsed, "", true);
-
-        // Check if foldout was clicked
-        Rect foldoutRect = GUILayoutUtility.GetLastRect();
-        bool foldoutClicked = Event.current.type == EventType.Used && foldoutRect.Contains(Event.current.mousePosition);
-
-        if (!foldoutClicked)
-        {
-            // Handle selection (but not if foldout was clicked)
-            if (Event.current.type == EventType.MouseDown && headerRect.Contains(Event.current.mousePosition))
-            {
-                if (Event.current.button == 0)
-                {
-                    selectedGroupIndex = index;
-                    selectedScene = null;
-                    Event.current.Use();
-                    Repaint();
-                }
-                else if (Event.current.button == 1)
-                {
-                    selectedGroupIndex = index;
-                    ShowGroupContextMenu(group);
-                    Event.current.Use();
-                }
-            }
-        }
-
-        group.isCollapsed = newCollapsed;
-
-        if (isSelected)
-        {
-            EditorGUI.DrawRect(headerRect, new Color(0.24f, 0.48f, 0.90f, 0.3f));
-        }
-
-        // Group name or rename field
         if (group.groupName == renamingGroup)
         {
-            GUI.SetNextControlName("GroupRenameField");
-            renamingGroupText = EditorGUILayout.TextField(renamingGroupText, GUILayout.ExpandWidth(true));
-
-            if (Event.current.type == EventType.Repaint && GUI.GetNameOfFocusedControl() != "GroupRenameField")
+            var field = new TextField { value = group.groupName };
+            field.AddToClassList("so-group__rename");
+            field.RegisterCallback<KeyDownEvent>(evt =>
             {
-                EditorGUI.FocusTextInControl("GroupRenameField");
-            }
-
-            if (Event.current.isKey && GUI.GetNameOfFocusedControl() == "GroupRenameField")
-            {
-                if (Event.current.keyCode == KeyCode.Return || Event.current.keyCode == KeyCode.KeypadEnter)
+                if (evt.keyCode == KeyCode.Return || evt.keyCode == KeyCode.KeypadEnter)
                 {
-                    RenameGroup(group.groupName, renamingGroupText);
+                    RenameGroup(group.groupName, field.value);
                     renamingGroup = null;
-                    renamingGroupText = "";
-                    Event.current.Use();
+                    RefreshGroups();
+                    evt.StopPropagation();
                 }
-                else if (Event.current.keyCode == KeyCode.Escape)
+                else if (evt.keyCode == KeyCode.Escape)
                 {
                     renamingGroup = null;
-                    renamingGroupText = "";
-                    Event.current.Use();
+                    RefreshGroups();
+                    evt.StopPropagation();
                 }
-            }
+            });
+            field.RegisterCallback<FocusOutEvent>(_ =>
+            {
+                if (renamingGroup == null) return;
+                RenameGroup(group.groupName, field.value);
+                renamingGroup = null;
+                RefreshGroups();
+            });
+            header.Add(field);
+            field.schedule.Execute(() => { field.Focus(); field.SelectAll(); }).StartingIn(0);
         }
         else
         {
-            GUILayout.Label($"{group.groupName} ({group.scenes.Count})", EditorStyles.boldLabel);
+            var name = new Label(group.groupName) { tooltip = "Click to collapse or expand" };
+            name.AddToClassList("so-group__name");
+            name.AddManipulator(new Clickable(() => foldout.value = !foldout.value));
+            header.Add(name);
+
+            var count = new Label(group.scenes.Count.ToString());
+            count.AddToClassList("so-group__count");
+            header.Add(count);
         }
 
-        GUILayout.FlexibleSpace();
+        var spacer = new VisualElement();
+        spacer.AddToClassList("so-group__spacer");
+        header.Add(spacer);
 
-        // Load all button (hide during rename)
-        if (group.groupName != renamingGroup && group.scenes.Count > 0)
+        var addSelected = new Button(() => AddSelectedScenesToGroup(group))
         {
-            GUIContent loadAllContent = new GUIContent("Load All", "Load all scenes in this group together (first scene single, rest additive)");
-            if (GUILayout.Button(loadAllContent, EditorStyles.miniButton, GUILayout.Width(60)))
+            text = "+",
+            tooltip = "Add the scenes selected on the left to this group",
+        };
+        addSelected.AddToClassList("so-btn");
+        addSelected.AddToClassList("so-btn--icon");
+        header.Add(addSelected);
+
+        if (group.scenes.Count > 0)
+        {
+            var loadAll = new Button(() => LoadAllScenesInGroup(group))
             {
-                if (debugMode) Debug.Log($"[Scene Organizer] Load All button clicked for group: {group.groupName}");
-                LoadAllScenesInGroup(group);
-            }
+                text = "Load All",
+                tooltip = "Open every scene in this group together (first single, rest additive)",
+            };
+            loadAll.AddToClassList("so-btn");
+            header.Add(loadAll);
         }
 
-        EditorGUILayout.EndHorizontal();
+        var menu = new Button { text = "⋮", tooltip = "Group actions" };
+        menu.AddToClassList("so-btn");
+        menu.AddToClassList("so-btn--icon");
+        menu.clicked += () => ShowGroupMenu(group, groupIndex, menu.worldBound);
+        header.Add(menu);
 
-        // Group content
-        if (!group.isCollapsed)
-        {
-            DrawGroupContent(group, index);
-        }
-
-        EditorGUILayout.EndVertical();
-
-        // Draw the color stripe
-        if (Event.current.type == EventType.Repaint)
-        {
-            Rect verticalRect = GUILayoutUtility.GetLastRect();
-            Rect fullStripeRect = new Rect(stripeRect.x, verticalRect.y, 4, verticalRect.height);
-            EditorGUI.DrawRect(fullStripeRect, group.groupColor);
-        }
-
-        EditorGUILayout.EndHorizontal();
-
-        // Handle drop on group
-        if (draggingScene != null && headerRect.Contains(Event.current.mousePosition))
-        {
-            targetGroup = group.groupName;
-
-            if (Event.current.type == EventType.Repaint)
-            {
-                EditorGUI.DrawRect(headerRect, new Color(0.3f, 0.7f, 0.3f, 0.3f));
-            }
-        }
-    }
-
-    private void DrawGroupContent(SceneGroupData.SceneGroup group, int groupIndex)
-    {
-        EditorGUI.indentLevel++;
-
-        // Clean up missing scenes
-        group.scenes.RemoveAll(s => !File.Exists(s));
+        body = new VisualElement();
+        body.AddToClassList("so-group__body");
 
         if (group.scenes.Count == 0)
         {
-            EditorGUILayout.LabelField("Drop scenes here", EditorStyles.centeredGreyMiniLabel);
+            var empty = new Label("Drop scenes here, or select some and press +");
+            empty.AddToClassList("so-group__empty");
+            body.Add(empty);
         }
         else
         {
-            List<string> scenesToRemove = new List<string>();
-
-            foreach (var scene in group.scenes)
-            {
-                DrawGroupSceneItem(group, scene, scenesToRemove);
-            }
-
-            foreach (var scene in scenesToRemove)
-            {
-                group.scenes.Remove(scene);
-                EditorUtility.SetDirty(sceneGroupData);
-            }
+            body.Add(BuildGroupSceneList(group));
         }
 
-        EditorGUI.indentLevel--;
+        body.style.display = group.isCollapsed ? DisplayStyle.None : DisplayStyle.Flex;
+        main.Add(body);
+
+        RegisterGroupDropTarget(card, group);
+        return card;
     }
 
-    private void DrawGroupSceneItem(SceneGroupData.SceneGroup group, string scenePath, List<string> scenesToRemove)
+    /// <summary>
+    /// Bound straight to the group's own list, so dragging a row to reorder rewrites the
+    /// saved order. Scene order matters here: it decides which scene loads first.
+    /// </summary>
+    private ListView BuildGroupSceneList(SceneGroupData.SceneGroup group)
     {
-        EditorGUILayout.BeginHorizontal();
-
-        // Scene icon
-        Rect iconRect = GUILayoutUtility.GetRect(16, 16, GUILayout.Width(16));
-        GUI.DrawTexture(iconRect, EditorGUIUtility.IconContent("SceneAsset Icon").image);
-
-        // Note indicator
-        if (assetNotesData != null && assetNotesData.HasNote(scenePath))
+        var list = new ListView
         {
-            Rect noteRect = GUILayoutUtility.GetRect(16, 16, GUILayout.Width(16));
-            GUI.Label(noteRect, new GUIContent("📝", assetNotesData.GetNote(scenePath)));
-        }
+            itemsSource = group.scenes,
+            fixedItemHeight = RowHeight,
+            selectionType = SelectionType.None,
+            virtualizationMethod = CollectionVirtualizationMethod.FixedHeight,
+            showBorder = false,
+            reorderable = true,
+            reorderMode = ListViewReorderMode.Animated,
+        };
 
-        // Scene name (non-clickable label)
-        GUILayout.Label(Path.GetFileNameWithoutExtension(scenePath), EditorStyles.label);
+        list.AddToClassList("so-group__scenes");
+        list.style.height = group.scenes.Count * RowHeight + 2f;
 
-        GUILayout.FlexibleSpace();
-
-        // Open button
-        GUIContent openContent = new GUIContent("Open", "Open this scene (closes other scenes)");
-        if (GUILayout.Button(openContent, EditorStyles.miniButton, GUILayout.Width(50)))
+        list.makeItem = () =>
         {
-            OpenScene(scenePath);
-        }
+            var row = new VisualElement();
+            row.AddToClassList("so-row");
 
-        // Context menu button (three dots)
-        if (GUILayout.Button("≡", EditorStyles.miniButton, GUILayout.Width(20)))
+            var icon = new Image { name = "icon", scaleMode = ScaleMode.ScaleToFit };
+            icon.AddToClassList("so-row__icon");
+            row.Add(icon);
+
+            var name = new Label { name = "name" };
+            name.AddToClassList("so-row__name");
+            row.Add(name);
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("so-row__spacer");
+            row.Add(spacer);
+
+            var open = new Button { name = "open", text = "Open", tooltip = "Open this scene (closes the others)" };
+            open.AddToClassList("so-btn");
+            row.Add(open);
+
+            var remove = new Button { name = "remove", text = "×", tooltip = "Remove from group" };
+            remove.AddToClassList("so-btn");
+            remove.AddToClassList("so-btn--icon");
+            row.Add(remove);
+
+            return row;
+        };
+
+        list.bindItem = (element, index) =>
         {
-            ShowGroupSceneContextMenu(group, scenePath);
-        }
+            if (index < 0 || index >= group.scenes.Count)
+                return;
 
-        // Remove button
-        if (GUILayout.Button("×", EditorStyles.miniButton, GUILayout.Width(20)))
-        {
-            scenesToRemove.Add(scenePath);
-        }
+            string path = group.scenes[index];
+            element.tooltip = path;
 
-        EditorGUILayout.EndHorizontal();
+            if (sceneIconContent != null)
+                element.Q<Image>("icon").image = sceneIconContent.image;
+
+            element.Q<Label>("name").text = Path.GetFileNameWithoutExtension(path);
+
+            var open = element.Q<Button>("open");
+            open.clickable = new Clickable(() => OpenScene(path));
+
+            var remove = element.Q<Button>("remove");
+            remove.clickable = new Clickable(() =>
+            {
+                group.scenes.Remove(path);
+                MarkGroupsDirty();
+                RefreshGroups();
+            });
+        };
+
+        list.itemIndexChanged += (_, __) => MarkGroupsDirty();
+
+        ReorderAnimationSpeed.Attach(list);
+
+        return list;
     }
 
-    private void ShowGroupContextMenu(SceneGroupData.SceneGroup group)
+    /// <summary>
+    /// Unity animates the reorder gap with a ValueAnimation whose duration is hardcoded
+    /// to 500 ms inside ListViewDraggerAnimated.Animate, with nothing public to tune. The
+    /// animation object itself is reachable though, so this shortens it while a drag is
+    /// running. Every lookup is reflective and guarded: if a future Unity moves these
+    /// internals, reordering simply keeps Unity's own timing instead of breaking.
+    /// </summary>
+    private static class ReorderAnimationSpeed
     {
-        GenericMenu menu = new GenericMenu();
+        private const int TargetDurationMs = 120;
+        private const long TickIntervalMs = 16;
+
+        private static readonly System.Reflection.PropertyInfo ActiveItems;
+        private static readonly System.Reflection.PropertyInfo Animator;
+        private static readonly System.Reflection.PropertyInfo DurationMs;
+        private static readonly bool Available;
+
+        static ReorderAnimationSpeed()
+        {
+            try
+            {
+                const System.Reflection.BindingFlags flags =
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Instance;
+
+                var assembly = typeof(ListView).Assembly;
+
+                ActiveItems = assembly
+                    .GetType("UnityEngine.UIElements.BaseVerticalCollectionView")
+                    ?.GetProperty("activeItems", flags);
+
+                Animator = assembly
+                    .GetType("UnityEngine.UIElements.ReusableCollectionItem")
+                    ?.GetProperty("animator", flags);
+
+                DurationMs = Animator?.PropertyType.GetProperty("durationMs");
+
+                Available = ActiveItems != null && Animator != null && DurationMs != null && DurationMs.CanWrite;
+            }
+            catch
+            {
+                Available = false;
+            }
+        }
+
+        public static void Attach(ListView list)
+        {
+            if (!Available)
+                return;
+
+            IVisualElementScheduledItem ticker = null;
+
+            // Only runs between pointer down and pointer up on this list, so there is no
+            // idle cost when nobody is dragging.
+            list.RegisterCallback<PointerDownEvent>(_ =>
+            {
+                if (ticker == null)
+                    ticker = list.schedule.Execute(() => Retune(list)).Every(TickIntervalMs);
+                else
+                    ticker.Resume();
+            });
+
+            list.RegisterCallback<PointerUpEvent>(_ => ticker?.Pause());
+            list.RegisterCallback<PointerCaptureOutEvent>(_ => ticker?.Pause());
+            list.RegisterCallback<DetachFromPanelEvent>(_ => ticker?.Pause());
+        }
+
+        private static void Retune(ListView list)
+        {
+            try
+            {
+                if (!(ActiveItems.GetValue(list) is System.Collections.IEnumerable items))
+                    return;
+
+                foreach (var item in items)
+                {
+                    object animation = Animator.GetValue(item);
+                    if (animation == null)
+                        continue;
+
+                    // Animations are pooled and reset to Unity's duration on reuse, so
+                    // this has to keep re-applying rather than run once.
+                    if ((int)DurationMs.GetValue(animation) > TargetDurationMs)
+                        DurationMs.SetValue(animation, TargetDurationMs);
+                }
+            }
+            catch
+            {
+                // Internals moved; leave Unity's timing alone.
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- drag & drop
+
+    private void StartSceneDrag()
+    {
+        var paths = GetSelectedScenePaths();
+        if (paths.Count == 0)
+            return;
+
+        var objects = new UnityEngine.Object[paths.Count];
+        for (int i = 0; i < paths.Count; i++)
+            objects[i] = AssetDatabase.LoadAssetAtPath<SceneAsset>(paths[i]);
+
+        DragAndDrop.PrepareStartDrag();
+        DragAndDrop.paths = paths.ToArray();
+        DragAndDrop.objectReferences = objects;
+        DragAndDrop.SetGenericData(DragKey, paths);
+        DragAndDrop.StartDrag(paths.Count == 1
+            ? Path.GetFileNameWithoutExtension(paths[0])
+            : paths.Count + " scenes");
+    }
+
+    private void RegisterGroupDropTarget(VisualElement card, SceneGroupData.SceneGroup group)
+    {
+        card.RegisterCallback<DragUpdatedEvent>(evt =>
+        {
+            if (GetDraggedScenePaths().Count == 0)
+                return;
+
+            DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+            card.AddToClassList("so-group--drop");
+            evt.StopPropagation();
+        });
+
+        card.RegisterCallback<DragLeaveEvent>(_ => card.RemoveFromClassList("so-group--drop"));
+        card.RegisterCallback<DragExitedEvent>(_ => card.RemoveFromClassList("so-group--drop"));
+
+        card.RegisterCallback<DragPerformEvent>(evt =>
+        {
+            var paths = GetDraggedScenePaths();
+            card.RemoveFromClassList("so-group--drop");
+
+            if (paths.Count == 0)
+                return;
+
+            DragAndDrop.AcceptDrag();
+            AddScenesToGroup(group, paths);
+            evt.StopPropagation();
+        });
+    }
+
+    private static List<string> GetDraggedScenePaths()
+    {
+        var result = new List<string>();
+
+        if (DragAndDrop.GetGenericData(DragKey) is List<string> carried)
+        {
+            result.AddRange(carried);
+            return result;
+        }
+
+        // Also accept scenes dragged in from the Project window.
+        var paths = DragAndDrop.paths;
+        if (paths != null)
+        {
+            foreach (var path in paths)
+                if (!string.IsNullOrEmpty(path) && path.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                    result.Add(path);
+        }
+
+        return result;
+    }
+
+    private List<string> GetSelectedScenePaths()
+    {
+        var paths = new List<string>();
+
+        if (sceneList == null)
+            return paths;
+
+        foreach (var item in sceneList.selectedItems)
+        {
+            if (item is int sceneIndex && sceneIndex >= 0 && sceneIndex < allScenes.Count)
+                paths.Add(allScenes[sceneIndex].Path);
+        }
+
+        return paths;
+    }
+
+    private void AddSelectedScenesToGroup(SceneGroupData.SceneGroup group)
+    {
+        var paths = GetSelectedScenePaths();
+
+        if (paths.Count == 0)
+        {
+            EditorUtility.DisplayDialog("Nothing Selected",
+                "Select one or more scenes in the left pane first.", "OK");
+            return;
+        }
+
+        AddScenesToGroup(group, paths);
+    }
+
+    private void AddScenesToGroup(SceneGroupData.SceneGroup group, List<string> paths)
+    {
+        int added = 0;
+
+        foreach (var path in paths)
+        {
+            if (group.scenes.Contains(path))
+                continue;
+
+            group.scenes.Add(path);
+            added++;
+        }
+
+        if (added == 0)
+            return;
+
+        MarkGroupsDirty();
+        RefreshGroups();
+    }
+
+    // ------------------------------------------------------------------- menus
+
+    private void BuildSceneContextMenu(DropdownMenu menu, string scenePath)
+    {
+        menu.AppendAction("Open", _ => OpenScene(scenePath));
+        menu.AppendAction("Open Additive", _ => EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Additive));
+        menu.AppendSeparator();
+
+        var selected = GetSelectedScenePaths();
+        if (sceneGroupData != null && sceneGroupData.sceneGroups.Count > 0)
+        {
+            string label = selected.Count > 1 ? $"Add {selected.Count} Selected to Group/" : "Add to Group/";
+            foreach (var group in sceneGroupData.sceneGroups)
+            {
+                var captured = group;
+                menu.AppendAction(label + group.groupName,
+                    _ => AddScenesToGroup(captured, selected.Count > 1 ? selected : new List<string> { scenePath }));
+            }
+            menu.AppendSeparator();
+        }
+
+        menu.AppendAction("Edit Note…", _ => SceneNoteEditorWindow.ShowWindow(scenePath, assetNotesData, this));
+        menu.AppendAction("Rename…", _ => PromptRenameScene(scenePath));
+        menu.AppendSeparator();
+        menu.AppendAction("Show in Project", _ =>
+            EditorGUIUtility.PingObject(AssetDatabase.LoadAssetAtPath<SceneAsset>(scenePath)));
+        menu.AppendAction("Copy Path", _ => EditorGUIUtility.systemCopyBuffer = scenePath);
+    }
+
+    private void ShowGroupMenu(SceneGroupData.SceneGroup group, int groupIndex, Rect anchor)
+    {
+        var menu = new GenericMenu();
 
         if (group.scenes.Count > 0)
         {
@@ -863,10 +1010,21 @@ public class SceneOrganizerWindow : EditorWindow
         menu.AddItem(new GUIContent("Rename"), false, () =>
         {
             renamingGroup = group.groupName;
-            renamingGroupText = group.groupName; // Initialize with current name
-            Repaint();
+            RefreshGroups();
         });
-        menu.AddItem(new GUIContent("Change Color"), false, () => ShowColorPicker(group));
+        menu.AddItem(new GUIContent("Change Colour…"), false, () => ColorPickerWindow.ShowWindow(group, this));
+        menu.AddSeparator("");
+
+        if (groupIndex > 0)
+            menu.AddItem(new GUIContent("Move Up"), false, () => MoveGroup(groupIndex, -1));
+        else
+            menu.AddDisabledItem(new GUIContent("Move Up"));
+
+        if (groupIndex < sceneGroupData.sceneGroups.Count - 1)
+            menu.AddItem(new GUIContent("Move Down"), false, () => MoveGroup(groupIndex, 1));
+        else
+            menu.AddDisabledItem(new GUIContent("Move Down"));
+
         menu.AddSeparator("");
         menu.AddItem(new GUIContent("Delete Group"), false, () =>
         {
@@ -877,175 +1035,228 @@ public class SceneOrganizerWindow : EditorWindow
             }
         });
 
-        menu.ShowAsContext();
+        menu.DropDown(anchor);
     }
 
-    private void ShowGroupSceneContextMenu(SceneGroupData.SceneGroup group, string scenePath)
+    private void MoveGroup(int index, int direction)
     {
-        GenericMenu menu = new GenericMenu();
+        int target = index + direction;
+        if (target < 0 || target >= sceneGroupData.sceneGroups.Count)
+            return;
 
-        menu.AddItem(new GUIContent("Open (Single)"), false, () => OpenScene(scenePath));
-        menu.AddItem(new GUIContent("Open Additive (Multi-Scene)"), false, () =>
-            EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Additive));
-        menu.AddSeparator("");
+        var group = sceneGroupData.sceneGroups[index];
+        sceneGroupData.sceneGroups.RemoveAt(index);
+        sceneGroupData.sceneGroups.Insert(target, group);
 
-        menu.AddItem(new GUIContent("Edit Note"), false, () =>
+        MarkGroupsDirty();
+        RefreshGroups();
+    }
+
+    private void PromptNewGroup()
+    {
+        TextPromptWindow.Show("New Group", "Group name", "", name =>
         {
-            SceneNoteEditorWindow.ShowWindow(scenePath, assetNotesData, this);
+            CreateNewGroup(name);
+            RefreshGroups();
         });
+    }
 
-        menu.AddSeparator("");
+    private void PromptRenameScene(string scenePath)
+    {
+        TextPromptWindow.Show("Rename Scene", "Scene name",
+            Path.GetFileNameWithoutExtension(scenePath), newName =>
+            {
+                RenameScene(scenePath, newName);
+                RefreshAll();
+            });
+    }
 
-        menu.AddItem(new GUIContent("Remove from Group"), false, () =>
+    // --------------------------------------------------------------- keyboard
+
+    private void OnKeyDown(KeyDownEvent evt)
+    {
+        if (sceneGroupData == null)
+            return;
+
+        switch (evt.keyCode)
         {
-            group.scenes.Remove(scenePath);
+            case KeyCode.F2:
+                var selected = GetSelectedScenePaths();
+                if (selected.Count == 1)
+                {
+                    PromptRenameScene(selected[0]);
+                    evt.StopPropagation();
+                }
+                break;
+
+            case KeyCode.Escape:
+                sceneList?.ClearSelection();
+                evt.StopPropagation();
+                break;
+        }
+    }
+
+    // ------------------------------------------------------------ scene loading
+
+    public void LoadScenes()
+    {
+        allScenes.Clear();
+        knownScenePaths.Clear();
+
+        string[] sceneGUIDs = AssetDatabase.FindAssets("t:Scene");
+        foreach (string guid in sceneGUIDs)
+        {
+            string path = AssetDatabase.GUIDToAssetPath(guid);
+            if (string.IsNullOrEmpty(path))
+                continue;
+
+            string name = Path.GetFileNameWithoutExtension(path);
+            allScenes.Add(new SceneEntry
+            {
+                Path = path,
+                Name = name,
+                Directory = Path.GetDirectoryName(path),
+                LowerName = name.ToLowerInvariant(),
+                LowerPath = path.ToLowerInvariant(),
+            });
+            knownScenePaths.Add(path);
+        }
+
+        SortScenes();
+        PruneMissingScenes();
+        InvalidateFilter();
+    }
+
+    /// <summary>
+    /// Drops references to scenes that no longer exist, at load time rather than as a
+    /// File.Exists per row per repaint.
+    /// </summary>
+    private void PruneMissingScenes()
+    {
+        if (sceneGroupData == null)
+            return;
+
+        int removed = sceneGroupData.recentScenes.RemoveAll(s => !knownScenePaths.Contains(s));
+
+        foreach (var group in sceneGroupData.sceneGroups)
+            removed += group.scenes.RemoveAll(s => !knownScenePaths.Contains(s));
+
+        if (removed > 0)
             EditorUtility.SetDirty(sceneGroupData);
-        });
+    }
 
-        if (sceneGroupData.sceneGroups.Count > 1)
+    private void SetSortMode(SceneSortMode mode)
+    {
+        sortMode = mode;
+        if (sortMenu != null)
+            sortMenu.text = "Sort: " + mode;
+
+        SortScenes();
+        SaveSettings();
+        RefreshSceneList();
+    }
+
+    private void SortScenes()
+    {
+        switch (sortMode)
         {
-            menu.AddSeparator("");
-            foreach (var otherGroup in sceneGroupData.sceneGroups)
-            {
-                if (otherGroup.groupName != group.groupName)
+            case SceneSortMode.Name:
+                allScenes.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+                break;
+
+            case SceneSortMode.Path:
+                allScenes.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
+                break;
+
+            case SceneSortMode.RecentlyUsed:
+                // recentScenes[0] is the most recent; anything never opened sorts last.
+                allScenes.Sort((a, b) =>
                 {
-                    menu.AddItem(new GUIContent("Move to/" + otherGroup.groupName), false, () =>
-                        MoveSceneToGroup(scenePath, group.groupName, otherGroup.groupName));
-                }
-            }
+                    int ra = RecentRank(a.Path);
+                    int rb = RecentRank(b.Path);
+                    return ra != rb
+                        ? ra.CompareTo(rb)
+                        : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+                });
+                break;
         }
 
-        menu.AddSeparator("");
-        menu.AddItem(new GUIContent("Show in Project"), false, () =>
-            EditorGUIUtility.PingObject(AssetDatabase.LoadAssetAtPath<SceneAsset>(scenePath)));
+        sceneIndexByPath.Clear();
+        for (int i = 0; i < allScenes.Count; i++)
+            sceneIndexByPath[allScenes[i].Path] = i;
 
-        menu.ShowAsContext();
+        InvalidateFilter();
     }
 
-    private void ShowColorPicker(SceneGroupData.SceneGroup group)
+    private int RecentRank(string path)
     {
-        ColorPickerWindow.ShowWindow(group, this);
-    }
-    #endregion
+        if (sceneGroupData == null)
+            return int.MaxValue;
 
-    #region Drag and Drop
-    private void HandleDragAndDrop()
+        int index = sceneGroupData.recentScenes.IndexOf(path);
+        return index < 0 ? int.MaxValue : index;
+    }
+
+    private void InvalidateFilter()
     {
-        if (Event.current.type == EventType.DragPerform)
-        {
-            if (draggingScene != null && targetGroup != null)
-            {
-                DragAndDrop.AcceptDrag();
-                AddSceneToGroup(draggingScene, targetGroup);
-                draggingScene = null;
-                targetGroup = null;
-                Event.current.Use();
-                Repaint();
-            }
-        }
-
-        if (Event.current.type == EventType.DragExited || Event.current.type == EventType.MouseUp)
-        {
-            draggingScene = null;
-            targetGroup = null;
-            Repaint();
-        }
+        filterCacheKey = null;
     }
 
-    private void HandleGroupsDragAndDrop()
+    private void RebuildFilter()
     {
-        if (DragAndDrop.paths != null && DragAndDrop.paths.Length > 0)
+        string key = searchQuery ?? string.Empty;
+        if (filterCacheKey == key)
+            return;
+
+        filterCacheKey = key;
+        filteredScenes.Clear();
+
+        if (string.IsNullOrEmpty(searchQuery))
         {
-            foreach (var path in DragAndDrop.paths)
-            {
-                if (path.EndsWith(".unity"))
-                {
-                    DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
-                }
-            }
+            for (int i = 0; i < allScenes.Count; i++)
+                filteredScenes.Add(i);
+
+            return;
+        }
+
+        string query = searchQuery.ToLowerInvariant();
+
+        for (int i = 0; i < allScenes.Count; i++)
+        {
+            SceneEntry entry = allScenes[i];
+
+            if (entry.LowerName.IndexOf(query, StringComparison.Ordinal) >= 0 ||
+                entry.LowerPath.IndexOf(query, StringComparison.Ordinal) >= 0)
+                filteredScenes.Add(i);
         }
     }
-    #endregion
 
-    #region Keyboard Shortcuts
-    private void HandleKeyboardShortcuts()
+    private void RebuildRecents()
     {
-        if (Event.current.type != EventType.KeyDown) return;
+        recentScenes.Clear();
 
-        // Delete - remove from group or delete scene
-        if (Event.current.keyCode == KeyCode.Delete)
-        {
-            if (selectedGroupIndex >= 0 && selectedGroupIndex < sceneGroupData.sceneGroups.Count)
-            {
-                var group = sceneGroupData.sceneGroups[selectedGroupIndex];
-                if (EditorUtility.DisplayDialog("Delete Group",
-                    $"Are you sure you want to delete '{group.groupName}'?", "Delete", "Cancel"))
-                {
-                    RemoveGroup(group);
-                    Event.current.Use();
-                }
-            }
-        }
+        if (sceneGroupData == null)
+            return;
 
-        // F2 - Rename
-        if (Event.current.keyCode == KeyCode.F2)
+        for (int i = 0; i < sceneGroupData.recentScenes.Count && recentScenes.Count < 5; i++)
         {
-            if (!string.IsNullOrEmpty(selectedScene))
-            {
-                renamingScene = selectedScene;
-                Event.current.Use();
-                Repaint();
-            }
-            else if (selectedGroupIndex >= 0)
-            {
-                renamingGroup = sceneGroupData.sceneGroups[selectedGroupIndex].groupName;
-                renamingGroupText = renamingGroup; // Initialize text
-                Event.current.Use();
-                Repaint();
-            }
-        }
-
-        // Escape - Clear selection or cancel rename
-        if (Event.current.keyCode == KeyCode.Escape)
-        {
-            if (renamingScene != null || renamingGroup != null || isCreatingNewGroup)
-            {
-                renamingScene = null;
-                renamingGroup = null;
-                isCreatingNewGroup = false;
-                newGroupName = "";
-                Event.current.Use();
-                Repaint();
-            }
-            else
-            {
-                selectedScene = null;
-                selectedGroupIndex = -1;
-                Event.current.Use();
-                Repaint();
-            }
-        }
-
-        // Return - Open scene
-        if (Event.current.keyCode == KeyCode.Return || Event.current.keyCode == KeyCode.KeypadEnter)
-        {
-            if (!string.IsNullOrEmpty(selectedScene) && renamingScene == null)
-            {
-                OpenScene(selectedScene);
-                Event.current.Use();
-            }
+            if (sceneIndexByPath.TryGetValue(sceneGroupData.recentScenes[i], out int index))
+                recentScenes.Add(index);
         }
     }
-    #endregion
 
-    #region Data Operations
+    private static void EnsureSceneIcon()
+    {
+        if (sceneIconContent == null || sceneIconContent.image == null)
+            sceneIconContent = EditorGUIUtility.IconContent("SceneAsset Icon");
+    }
+
+    // ------------------------------------------------------------ data operations
+
     private void CreateNewGroup(string groupName)
     {
         if (string.IsNullOrWhiteSpace(groupName))
-        {
-            EditorUtility.DisplayDialog("Invalid Name", "Group name cannot be empty.", "OK");
             return;
-        }
 
         if (sceneGroupData.sceneGroups.Exists(g => g.groupName == groupName))
         {
@@ -1053,105 +1264,80 @@ public class SceneOrganizerWindow : EditorWindow
             return;
         }
 
-        var newGroup = new SceneGroupData.SceneGroup
+        sceneGroupData.sceneGroups.Add(new SceneGroupData.SceneGroup
         {
             groupName = groupName,
-            groupColor = GetRandomPastelColor()
-        };
+            groupColor = GetRandomPastelColor(),
+        });
 
-        sceneGroupData.sceneGroups.Add(newGroup);
-        EditorUtility.SetDirty(sceneGroupData);
-        SaveGroups();
-        Repaint();
+        MarkGroupsDirty();
     }
 
-    private Color GetRandomPastelColor()
+    private static Color GetRandomPastelColor()
     {
-        Color[] colors = new Color[]
+        Color[] colors =
         {
-        new Color(0.3f, 0.6f, 1f),      // Blue
-        new Color(1f, 0.4f, 0.4f),      // Red
-        new Color(0.4f, 0.9f, 0.4f),    // Green
-        new Color(1f, 0.8f, 0.2f),      // Yellow
-        new Color(0.9f, 0.4f, 0.9f),    // Magenta
-        new Color(0.4f, 0.9f, 0.9f),    // Cyan
+            new Color(0.3f, 0.6f, 1f),
+            new Color(1f, 0.4f, 0.4f),
+            new Color(0.4f, 0.9f, 0.4f),
+            new Color(1f, 0.8f, 0.2f),
+            new Color(0.9f, 0.4f, 0.9f),
+            new Color(0.4f, 0.9f, 0.9f),
         };
+
         return colors[UnityEngine.Random.Range(0, colors.Length)];
     }
 
     private void RenameGroup(string oldName, string newName)
     {
-        if (string.IsNullOrWhiteSpace(newName)) return;
+        if (string.IsNullOrWhiteSpace(newName) || oldName == newName)
+            return;
 
         var group = sceneGroupData.sceneGroups.Find(g => g.groupName == oldName);
-        if (group != null)
-        {
-            group.groupName = newName;
-            EditorUtility.SetDirty(sceneGroupData);
-            SaveGroups();
-        }
+        if (group == null)
+            return;
+
+        group.groupName = newName;
+        MarkGroupsDirty();
     }
 
     private void RenameScene(string oldScenePath, string newSceneName)
     {
-        if (string.IsNullOrWhiteSpace(newSceneName)) return;
+        if (string.IsNullOrWhiteSpace(newSceneName))
+            return;
 
         string error = AssetDatabase.RenameAsset(oldScenePath, newSceneName);
+
         if (!string.IsNullOrEmpty(error))
         {
             EditorUtility.DisplayDialog("Rename Failed", error, "OK");
+            return;
         }
-        else
-        {
-            AssetDatabase.SaveAssets();
-            LoadScenes();
-        }
-    }
 
-    private void AddSceneToGroup(string scene, string groupName)
-    {
-        var group = sceneGroupData.sceneGroups.Find(g => g.groupName == groupName);
-        if (group != null && !group.scenes.Contains(scene))
-        {
-            group.scenes.Add(scene);
-            EditorUtility.SetDirty(sceneGroupData);
-            SaveGroups();
-        }
-    }
-
-    private void MoveSceneToGroup(string scene, string fromGroup, string toGroup)
-    {
-        var sourceGroup = sceneGroupData.sceneGroups.Find(g => g.groupName == fromGroup);
-        var targetGroup = sceneGroupData.sceneGroups.Find(g => g.groupName == toGroup);
-
-        if (sourceGroup != null && targetGroup != null)
-        {
-            sourceGroup.scenes.Remove(scene);
-            if (!targetGroup.scenes.Contains(scene))
-            {
-                targetGroup.scenes.Add(scene);
-            }
-            EditorUtility.SetDirty(sceneGroupData);
-            SaveGroups();
-        }
+        AssetDatabase.SaveAssets();
+        LoadScenes();
     }
 
     private void RemoveGroup(SceneGroupData.SceneGroup group)
     {
         sceneGroupData.sceneGroups.Remove(group);
-        selectedGroupIndex = -1;
-        EditorUtility.SetDirty(sceneGroupData);
-        SaveGroups();
+        MarkGroupsDirty();
+        RefreshGroups();
     }
 
     private void OpenScene(string scenePath)
     {
-        if (EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo())
-        {
-            EditorSceneManager.OpenScene(scenePath);
-            sceneGroupData.AddToRecent(scenePath);
-            EditorUtility.SetDirty(sceneGroupData);
-        }
+        if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo())
+            return;
+
+        EditorSceneManager.OpenScene(scenePath);
+        sceneGroupData.AddToRecent(scenePath);
+        MarkGroupsDirty();
+
+        if (sortMode == SceneSortMode.RecentlyUsed)
+            SortScenes();
+
+        RefreshSceneList();
     }
 
     private void LoadAllScenesInGroup(SceneGroupData.SceneGroup group)
@@ -1162,34 +1348,26 @@ public class SceneOrganizerWindow : EditorWindow
             return;
         }
 
-        // Validate that at least the first scene exists
         if (!File.Exists(group.scenes[0]))
         {
             EditorUtility.DisplayDialog("Scene Not Found",
                 $"The first scene in group '{group.groupName}' could not be found:\n{group.scenes[0]}\n\nPlease refresh the scene list.",
                 "OK");
-            Debug.LogError($"Scene not found: {group.scenes[0]}");
             return;
         }
 
         if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo())
-        {
-            Debug.Log("Load All cancelled by user.");
             return;
-        }
 
         try
         {
-            // Load first scene normally, then load rest additively (multi-scene editing)
-            if (debugMode) Debug.Log($"[Scene Organizer] Loading scene: {group.scenes[0]}");
             EditorSceneManager.OpenScene(group.scenes[0]);
-
             int loadedCount = 1;
+
             for (int i = 1; i < group.scenes.Count; i++)
             {
                 if (File.Exists(group.scenes[i]))
                 {
-                    if (debugMode) Debug.Log($"[Scene Organizer] Loading additive scene: {group.scenes[i]}");
                     EditorSceneManager.OpenScene(group.scenes[i], OpenSceneMode.Additive);
                     loadedCount++;
                 }
@@ -1199,8 +1377,6 @@ public class SceneOrganizerWindow : EditorWindow
                 }
             }
 
-            if (debugMode) Debug.Log($"<color=green>[Scene Organizer] Successfully loaded {loadedCount}/{group.scenes.Count} scene(s) from group '{group.groupName}'</color>");
-
             if (loadedCount < group.scenes.Count)
             {
                 EditorUtility.DisplayDialog("Scenes Loaded with Warnings",
@@ -1208,57 +1384,82 @@ public class SceneOrganizerWindow : EditorWindow
                     "OK");
             }
         }
-        catch (System.Exception e)
+        catch (Exception e)
         {
             EditorUtility.DisplayDialog("Error Loading Scenes",
-                $"An error occurred while loading scenes:\n{e.Message}",
-                "OK");
+                $"An error occurred while loading scenes:\n{e.Message}", "OK");
             Debug.LogError($"Error loading scenes from group '{group.groupName}': {e}");
         }
     }
-    #endregion
 
-    #region Save/Load
+    // ------------------------------------------------------------- settings/IO
+
+    private void LoadSettings()
+    {
+        enableBackup = EditorPrefs.GetBool(SceneOrganizerConstants.PREF_ENABLE_BACKUP, false);
+        backupDirectory = EditorPrefs.GetString(SceneOrganizerConstants.PREF_BACKUP_DIR, Application.dataPath);
+        showRecentScenes = EditorPrefs.GetBool(SceneOrganizerConstants.PREF_SHOW_RECENT, true);
+        showScenePath = EditorPrefs.GetBool("SceneOrganizer_ShowPath", false);
+        sortMode = (SceneSortMode)EditorPrefs.GetInt("SceneOrganizer_SortMode", 0);
+        leftPaneWidth = EditorPrefs.GetFloat("SceneOrganizer_LeftPaneWidth", 300f);
+    }
+
+    private void SaveSettings()
+    {
+        EditorPrefs.SetBool(SceneOrganizerConstants.PREF_SHOW_RECENT, showRecentScenes);
+        EditorPrefs.SetBool("SceneOrganizer_ShowPath", showScenePath);
+        EditorPrefs.SetInt("SceneOrganizer_SortMode", (int)sortMode);
+        EditorPrefs.SetFloat("SceneOrganizer_LeftPaneWidth", leftPaneWidth);
+    }
+
+    private void LoadAssetNotes()
+    {
+        const string assetPath = "Assets/Editor/AssetNotesData.asset";
+        assetNotesData = AssetDatabase.LoadAssetAtPath<AssetNotesData>(assetPath);
+
+        if (assetNotesData != null)
+            return;
+
+        if (!AssetDatabase.IsValidFolder("Assets/Editor"))
+            AssetDatabase.CreateFolder("Assets", "Editor");
+
+        assetNotesData = CreateInstance<AssetNotesData>();
+        AssetDatabase.CreateAsset(assetNotesData, assetPath);
+        AssetDatabase.SaveAssets();
+    }
+
     public void LoadGroups()
     {
         try
         {
-            string fullPath = Path.GetFullPath(Path.Combine(Application.dataPath, "..",
-                SceneOrganizerConstants.ASSET_PATH));
-            string directory = Path.GetDirectoryName(fullPath);
-
-            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
-            {
-                Directory.CreateDirectory(directory);
-            }
-
+            EnsureAssetFolder();
             sceneGroupData = AssetDatabase.LoadAssetAtPath<SceneGroupData>(SceneOrganizerConstants.ASSET_PATH);
 
             if (sceneGroupData == null)
-            {
                 CreateNewSceneGroupData();
-            }
         }
         catch (Exception ex)
         {
             Debug.LogError($"Failed to load groups: {ex.Message}");
             CreateNewSceneGroupData();
         }
+
+        RefreshGroups();
+    }
+
+    private static void EnsureAssetFolder()
+    {
+        string directory = Path.GetDirectoryName(SceneOrganizerConstants.ASSET_PATH);
+
+        if (!string.IsNullOrEmpty(directory) && !AssetDatabase.IsValidFolder(directory))
+            AssetDatabase.CreateFolder("Assets", "Editor");
     }
 
     private void CreateNewSceneGroupData()
     {
         try
         {
-            string fullPath = Path.GetFullPath(Path.Combine(Application.dataPath, "..",
-                SceneOrganizerConstants.ASSET_PATH));
-            string directory = Path.GetDirectoryName(fullPath);
-
-            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
-            {
-                Directory.CreateDirectory(directory);
-            }
-
+            EnsureAssetFolder();
             sceneGroupData = CreateInstance<SceneGroupData>();
             AssetDatabase.CreateAsset(sceneGroupData, SceneOrganizerConstants.ASSET_PATH);
             AssetDatabase.SaveAssets();
@@ -1271,15 +1472,16 @@ public class SceneOrganizerWindow : EditorWindow
 
     private void SaveGroups()
     {
-        if (sceneGroupData == null) return;
+        pendingSave?.Pause();
+
+        if (sceneGroupData == null)
+            return;
 
         EditorUtility.SetDirty(sceneGroupData);
         AssetDatabase.SaveAssets();
 
         if (enableBackup && !string.IsNullOrEmpty(backupDirectory))
-        {
             BackupGroups();
-        }
     }
 
     private void BackupGroups()
@@ -1287,13 +1489,10 @@ public class SceneOrganizerWindow : EditorWindow
         try
         {
             if (!Directory.Exists(backupDirectory))
-            {
                 Directory.CreateDirectory(backupDirectory);
-            }
 
             string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-            string backupFileName = $"SceneGroupData_Backup_{timestamp}.asset";
-            string backupPath = Path.Combine(backupDirectory, backupFileName);
+            string backupPath = Path.Combine(backupDirectory, $"SceneGroupData_Backup_{timestamp}.asset");
             string sourcePath = Path.Combine(Application.dataPath, "..", SceneOrganizerConstants.ASSET_PATH);
 
             if (File.Exists(sourcePath))
@@ -1312,19 +1511,18 @@ public class SceneOrganizerWindow : EditorWindow
     {
         try
         {
-            if (!Directory.Exists(backupDirectory)) return;
+            if (!Directory.Exists(backupDirectory))
+                return;
 
             string[] backupFiles = Directory.GetFiles(backupDirectory, "SceneGroupData_Backup_*.asset");
 
-            if (backupFiles.Length > SceneOrganizerConstants.MAX_BACKUP_COPIES)
-            {
-                Array.Sort(backupFiles);
+            if (backupFiles.Length <= SceneOrganizerConstants.MAX_BACKUP_COPIES)
+                return;
 
-                for (int i = 0; i < backupFiles.Length - SceneOrganizerConstants.MAX_BACKUP_COPIES; i++)
-                {
-                    File.Delete(backupFiles[i]);
-                }
-            }
+            Array.Sort(backupFiles);
+
+            for (int i = 0; i < backupFiles.Length - SceneOrganizerConstants.MAX_BACKUP_COPIES; i++)
+                File.Delete(backupFiles[i]);
         }
         catch (Exception ex)
         {
@@ -1340,222 +1538,269 @@ public class SceneOrganizerWindow : EditorWindow
         EditorPrefs.SetBool(SceneOrganizerConstants.PREF_ENABLE_BACKUP, enableBackup);
         EditorPrefs.SetString(SceneOrganizerConstants.PREF_BACKUP_DIR, backupDirectory);
     }
-    #endregion
 
-    #region UI Helpers
-    private void DrawHorizontalLine()
+    // ------------------------------------------------------------ helper windows
+
+    /// <summary>Small modal used for naming a new group and renaming scenes.</summary>
+    public class TextPromptWindow : EditorWindow
     {
-        EditorGUI.DrawRect(EditorGUILayout.GetControlRect(false, 1), new Color(0.5f, 0.5f, 0.5f, 0.5f));
+        private string value;
+        private string label;
+        private Action<string> onAccept;
+
+        public static void Show(string title, string label, string initial, Action<string> onAccept)
+        {
+            var window = CreateInstance<TextPromptWindow>();
+            window.titleContent = new GUIContent(title);
+            window.label = label;
+            window.value = initial;
+            window.onAccept = onAccept;
+            window.minSize = new Vector2(320, 96);
+            window.maxSize = new Vector2(320, 96);
+            window.ShowModalUtility();
+        }
+
+        private void CreateGUI()
+        {
+            var root = rootVisualElement;
+            root.style.paddingLeft = 10;
+            root.style.paddingRight = 10;
+            root.style.paddingTop = 10;
+
+            var field = new TextField(label) { value = value };
+            field.RegisterValueChangedCallback(evt => value = evt.newValue);
+            root.Add(field);
+
+            var buttons = new VisualElement();
+            buttons.style.flexDirection = FlexDirection.Row;
+            buttons.style.justifyContent = Justify.FlexEnd;
+            buttons.style.marginTop = 10;
+
+            var cancel = new Button(Close) { text = "Cancel" };
+            cancel.style.minWidth = 70;
+            buttons.Add(cancel);
+
+            var accept = new Button(Accept) { text = "OK" };
+            accept.style.minWidth = 70;
+            buttons.Add(accept);
+
+            root.Add(buttons);
+
+            field.RegisterCallback<KeyDownEvent>(evt =>
+            {
+                if (evt.keyCode == KeyCode.Return || evt.keyCode == KeyCode.KeypadEnter)
+                {
+                    Accept();
+                    evt.StopPropagation();
+                }
+                else if (evt.keyCode == KeyCode.Escape)
+                {
+                    Close();
+                    evt.StopPropagation();
+                }
+            });
+
+            field.schedule.Execute(() => { field.Focus(); field.SelectAll(); }).StartingIn(0);
+        }
+
+        private void Accept()
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return;
+
+            var callback = onAccept;
+            string result = value;
+            Close();
+            callback?.Invoke(result);
+        }
     }
-    #endregion
 
     public class ColorPickerWindow : EditorWindow
     {
         private SceneGroupData.SceneGroup group;
         private SceneOrganizerWindow parentWindow;
-        private Color selectedColor;
+        private Color selected;
 
-        private static readonly Color[] presetColors = new Color[]
+        private static readonly Color[] presetColors =
         {
-        new Color(0.3f, 0.6f, 1f),      // Blue
-        new Color(1f, 0.4f, 0.4f),      // Red
-        new Color(0.4f, 0.9f, 0.4f),    // Green
-        new Color(1f, 0.8f, 0.2f),      // Yellow
-        new Color(0.9f, 0.4f, 0.9f),    // Magenta
-        new Color(0.4f, 0.9f, 0.9f),    // Cyan
-        new Color(1f, 0.6f, 0.2f),      // Orange
-        new Color(0.7f, 0.5f, 1f),      // Purple
-        new Color(1f, 0.5f, 0.7f),      // Pink
-        new Color(0.5f, 0.8f, 0.5f),    // Light Green
-        new Color(0.6f, 0.6f, 0.6f),    // Gray
-        new Color(0.5f, 0.7f, 0.9f),    // Light Blue
+            new Color(0.3f, 0.6f, 1f), new Color(1f, 0.4f, 0.4f), new Color(0.4f, 0.9f, 0.4f),
+            new Color(1f, 0.8f, 0.2f), new Color(0.9f, 0.4f, 0.9f), new Color(0.4f, 0.9f, 0.9f),
+            new Color(1f, 0.6f, 0.2f), new Color(0.7f, 0.5f, 1f), new Color(1f, 0.5f, 0.7f),
+            new Color(0.5f, 0.8f, 0.5f), new Color(0.6f, 0.6f, 0.6f), new Color(0.5f, 0.7f, 0.9f),
         };
 
         public static void ShowWindow(SceneGroupData.SceneGroup group, SceneOrganizerWindow parent)
         {
-            var window = GetWindow<ColorPickerWindow>(true, "Choose Color", true);
+            var window = CreateInstance<ColorPickerWindow>();
+            window.titleContent = new GUIContent("Group Colour");
             window.group = group;
             window.parentWindow = parent;
-            window.selectedColor = group.groupColor;
-            window.minSize = new Vector2(300, 360);
-            window.maxSize = new Vector2(300, 360);
+            window.selected = group.groupColor;
+            window.minSize = new Vector2(240, 260);
+            window.maxSize = new Vector2(240, 260);
             window.ShowUtility();
         }
 
-        private void OnGUI()
+        private void CreateGUI()
         {
-            GUILayout.Space(10);
+            var root = rootVisualElement;
 
-            EditorGUILayout.LabelField("Preset Colors", EditorStyles.boldLabel);
-            GUILayout.Space(5);
+            var sheet = parentWindow != null ? parentWindow.LoadStyleSheet() : null;
+            if (sheet != null)
+                root.styleSheets.Add(sheet);
 
-            // Draw preset colors in a grid
-            int columns = 4;
-            int rows = Mathf.CeilToInt(presetColors.Length / (float)columns);
+            root.style.paddingLeft = 8;
+            root.style.paddingRight = 8;
+            root.style.paddingTop = 8;
 
-            for (int row = 0; row < rows; row++)
+            var grid = new VisualElement();
+            grid.AddToClassList("so-swatch-grid");
+
+            var swatches = new List<VisualElement>();
+
+            foreach (var color in presetColors)
             {
-                EditorGUILayout.BeginHorizontal();
-                GUILayout.FlexibleSpace();
+                var captured = color;
+                var swatch = new VisualElement();
+                swatch.AddToClassList("so-swatch-grid__item");
+                swatch.style.backgroundColor = captured;
 
-                for (int col = 0; col < columns; col++)
+                if (Approximately(captured, selected))
+                    swatch.AddToClassList("so-swatch-grid__item--selected");
+
+                swatch.AddManipulator(new Clickable(() =>
                 {
-                    int index = row * columns + col;
-                    if (index >= presetColors.Length) break;
+                    selected = captured;
+                    foreach (var other in swatches)
+                        other.EnableInClassList("so-swatch-grid__item--selected", other == swatch);
+                }));
 
-                    Color color = presetColors[index];
-                    bool isSelected = ColorsEqual(color, selectedColor);
+                swatches.Add(swatch);
+                grid.Add(swatch);
+            }
 
-                    GUIStyle buttonStyle = new GUIStyle(GUI.skin.button);
-                    buttonStyle.margin = new RectOffset(4, 4, 4, 4);
+            root.Add(grid);
 
-                    Rect buttonRect = GUILayoutUtility.GetRect(60, 60, buttonStyle);
+            var custom = new UnityEditor.UIElements.ColorField("Custom") { value = selected, showAlpha = false };
+            custom.style.marginTop = 8;
+            custom.RegisterValueChangedCallback(evt =>
+            {
+                selected = evt.newValue;
+                foreach (var other in swatches)
+                    other.RemoveFromClassList("so-swatch-grid__item--selected");
+            });
+            root.Add(custom);
 
-                    if (isSelected)
-                    {
-                        Rect borderRect = new Rect(buttonRect.x - 2, buttonRect.y - 2,
-                            buttonRect.width + 4, buttonRect.height + 4);
-                        EditorGUI.DrawRect(borderRect, Color.white);
-                    }
+            var buttons = new VisualElement();
+            buttons.style.flexDirection = FlexDirection.Row;
+            buttons.style.justifyContent = Justify.FlexEnd;
+            buttons.style.marginTop = 10;
 
-                    EditorGUI.DrawRect(buttonRect, color);
+            var cancel = new Button(Close) { text = "Cancel" };
+            cancel.style.minWidth = 70;
+            buttons.Add(cancel);
 
-                    if (GUI.Button(buttonRect, "", GUIStyle.none))
-                    {
-                        selectedColor = color;
-                    }
+            var apply = new Button(() =>
+            {
+                group.groupColor = selected;
+
+                if (parentWindow != null)
+                {
+                    parentWindow.MarkGroupsDirty();
+                    parentWindow.RefreshGroups();
                 }
 
-                GUILayout.FlexibleSpace();
-                EditorGUILayout.EndHorizontal();
-            }
-
-            GUILayout.Space(10);
-            DrawHorizontalLine();
-            GUILayout.Space(10);
-
-            // Custom color picker
-            EditorGUILayout.LabelField("Custom Color", EditorStyles.boldLabel);
-            GUILayout.Space(5);
-
-            EditorGUILayout.BeginHorizontal();
-            GUILayout.FlexibleSpace();
-            selectedColor = EditorGUILayout.ColorField(GUIContent.none, selectedColor,
-                false, true, false, GUILayout.Width(260), GUILayout.Height(40));
-            GUILayout.FlexibleSpace();
-            EditorGUILayout.EndHorizontal();
-
-            GUILayout.FlexibleSpace();
-
-            // Buttons
-            EditorGUILayout.BeginHorizontal();
-            GUILayout.FlexibleSpace();
-
-            if (GUILayout.Button("Apply", GUILayout.Width(80)))
-            {
-                group.groupColor = selectedColor;
-                EditorUtility.SetDirty(parentWindow.GetSceneGroupData());
-                parentWindow.Repaint();
                 Close();
-            }
+            })
+            { text = "Apply" };
+            apply.style.minWidth = 70;
+            buttons.Add(apply);
 
-            if (GUILayout.Button("Cancel", GUILayout.Width(80)))
-            {
-                Close();
-            }
-
-            GUILayout.FlexibleSpace();
-            EditorGUILayout.EndHorizontal();
-
-            GUILayout.Space(10);
+            root.Add(buttons);
         }
 
-        private bool ColorsEqual(Color a, Color b)
+        private static bool Approximately(Color a, Color b)
         {
-            return Mathf.Approximately(a.r, b.r) &&
-                   Mathf.Approximately(a.g, b.g) &&
-                   Mathf.Approximately(a.b, b.b);
-        }
-
-        private void DrawHorizontalLine()
-        {
-            EditorGUI.DrawRect(EditorGUILayout.GetControlRect(false, 1),
-                new Color(0.5f, 0.5f, 0.5f, 0.5f));
+            return Mathf.Approximately(a.r, b.r) && Mathf.Approximately(a.g, b.g) && Mathf.Approximately(a.b, b.b);
         }
     }
 
-    // Helper window for editing scene notes
     public class SceneNoteEditorWindow : EditorWindow
     {
         private string scenePath;
         private AssetNotesData notesData;
-        private string noteText;
-        private Vector2 scrollPos;
         private SceneOrganizerWindow parentWindow;
+        private string noteText;
 
         public static void ShowWindow(string scenePath, AssetNotesData data, SceneOrganizerWindow parent)
         {
-            var window = GetWindow<SceneNoteEditorWindow>(true, "Edit Scene Note", true);
-            window.minSize = new Vector2(400, 200);
+            var window = CreateInstance<SceneNoteEditorWindow>();
+            window.titleContent = new GUIContent("Scene Note");
             window.scenePath = scenePath;
             window.notesData = data;
-            window.noteText = data != null ? data.GetNote(scenePath) : "";
             window.parentWindow = parent;
+            window.noteText = data != null ? data.GetNote(scenePath) : "";
+            window.minSize = new Vector2(400, 220);
             window.ShowUtility();
         }
 
-        private void OnGUI()
+        private void CreateGUI()
         {
-            EditorGUILayout.Space(5);
-            EditorGUILayout.LabelField($"Note for: {Path.GetFileNameWithoutExtension(scenePath)}",
-                EditorStyles.boldLabel);
+            var root = rootVisualElement;
+            root.style.paddingLeft = 10;
+            root.style.paddingRight = 10;
+            root.style.paddingTop = 8;
+            root.style.paddingBottom = 8;
 
-            EditorGUILayout.LabelField($"Path: {scenePath}", EditorStyles.miniLabel);
+            var title = new Label(Path.GetFileNameWithoutExtension(scenePath));
+            title.style.unityFontStyleAndWeight = FontStyle.Bold;
+            root.Add(title);
 
-            EditorGUILayout.Space(5);
+            var path = new Label(scenePath);
+            path.style.fontSize = 10;
+            path.style.opacity = 0.6f;
+            path.style.marginBottom = 6;
+            root.Add(path);
 
-            scrollPos = EditorGUILayout.BeginScrollView(scrollPos);
-            noteText = EditorGUILayout.TextArea(noteText,
-                GUILayout.ExpandHeight(true));
-            EditorGUILayout.EndScrollView();
+            var field = new TextField { multiline = true, value = noteText };
+            field.style.flexGrow = 1;
+            field.style.whiteSpace = WhiteSpace.Normal;
+            field.RegisterValueChangedCallback(evt => noteText = evt.newValue);
+            root.Add(field);
 
-            EditorGUILayout.Space(5);
+            var buttons = new VisualElement();
+            buttons.style.flexDirection = FlexDirection.Row;
+            buttons.style.marginTop = 8;
 
-            EditorGUILayout.BeginHorizontal();
+            var clear = new Button(() => { noteText = ""; field.value = ""; }) { text = "Clear" };
+            clear.style.minWidth = 70;
+            buttons.Add(clear);
 
-            if (GUILayout.Button("Clear", GUILayout.Width(80)))
-            {
-                noteText = "";
-                GUI.FocusControl(null);
-                Repaint();
-            }
+            var spacer = new VisualElement();
+            spacer.style.flexGrow = 1;
+            buttons.Add(spacer);
 
-            GUILayout.FlexibleSpace();
+            var cancel = new Button(Close) { text = "Cancel" };
+            cancel.style.minWidth = 70;
+            buttons.Add(cancel);
 
-            if (GUILayout.Button("Cancel", GUILayout.Width(80)))
-            {
-                Close();
-            }
-
-            if (GUILayout.Button("Save", GUILayout.Width(80)))
+            var save = new Button(() =>
             {
                 if (notesData != null)
                 {
                     notesData.SetNote(scenePath, noteText);
                     EditorUtility.SetDirty(notesData);
                     AssetDatabase.SaveAssets();
-                    Debug.Log($"[Scene Organizer] Saved note for scene: {Path.GetFileNameWithoutExtension(scenePath)}");
-
-                    // Repaint parent window to show the note indicator
-                    if (parentWindow != null)
-                    {
-                        parentWindow.Repaint();
-                    }
+                    parentWindow?.RefreshSceneList();
                 }
-                Close();
-            }
 
-            EditorGUILayout.EndHorizontal();
+                Close();
+            })
+            { text = "Save" };
+            save.style.minWidth = 70;
+            buttons.Add(save);
+
+            root.Add(buttons);
         }
     }
 }
