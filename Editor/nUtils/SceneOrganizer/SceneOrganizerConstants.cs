@@ -5,6 +5,29 @@ public static class SceneOrganizerConstants
     // Paths
     public const string ASSET_PATH = "Assets/Editor/SceneGroupData.asset";
 
+    /// <summary>
+    /// Where backups go unless the user picks a folder: the project's UserSettings, which
+    /// Unity does not import. Backups inside Assets became assets themselves, each one
+    /// imported (and a project change) as it was written.
+    /// </summary>
+    public static string DefaultBackupDirectory =>
+        System.IO.Path.GetFullPath("UserSettings/nUtilities/SceneOrganizerBackups").Replace('\\', '/');
+
+    /// <summary>True for a folder inside the project's Assets folder.</summary>
+    public static bool IsInsideAssets(string directory)
+    {
+        if (string.IsNullOrEmpty(directory))
+            return false;
+
+        string assets = System.IO.Path.GetFullPath(Application.dataPath).Replace('\\', '/').TrimEnd('/');
+        string full = System.IO.Path.GetFullPath(directory).Replace('\\', '/').TrimEnd('/');
+        return full.Equals(assets, System.StringComparison.OrdinalIgnoreCase)
+            || full.StartsWith(assets + "/", System.StringComparison.OrdinalIgnoreCase);
+    }
+
+    // EditorPrefs keys for the Create Scene window.
+    public const string PREF_NEW_SCENE_FOLDER = "SceneOrganizer_NewSceneFolder";
+
     // EditorPrefs Keys
     public const string PREF_ENABLE_BACKUP = "SceneOrganizer_EnableBackup";
     public const string PREF_BACKUP_DIR = "SceneOrganizer_BackupDirectory";

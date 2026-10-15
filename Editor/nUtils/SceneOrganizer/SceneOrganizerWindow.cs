@@ -30,6 +30,21 @@ public class SceneOrganizerWindow : EditorWindow
     private readonly List<SceneEntry> allScenes = new List<SceneEntry>();
     private readonly Dictionary<string, int> sceneIndexByPath = new Dictionary<string, int>(StringComparer.Ordinal);
     private readonly HashSet<string> knownScenePaths = new HashSet<string>(StringComparer.Ordinal);
+    // Scenes loaded in the editor right now, marked in the lists.
+    private readonly HashSet<string> openScenes = new HashSet<string>(StringComparer.Ordinal);
+
+    /// <summary>A scene row's parts, found once when the row is made rather than on every bind.</summary>
+    private sealed class SceneRow
+    {
+        public int SceneIndex = -1;
+        public string Path;
+        public Image Icon;
+        public Label Name;
+        public Image Note;
+        public Label Location;
+        public Button Open;
+        public Button Remove;
+    }
 
     // Indices into allScenes. Recomputed only when the query or the scene list changes.
     private readonly List<int> filteredScenes = new List<int>();
@@ -89,46 +104,77 @@ public class SceneOrganizerWindow : EditorWindow
         LoadAssetNotes();
         LoadScenes();
 
-        EditorApplication.projectChanged += OnProjectChanged;
+        // Restored mid-reload, the AssetDatabase may not list anything yet: look again once it has settled.
+        if (allScenes.Count == 0)
+            EditorApplication.delayCall += () => { if (this != null) { LoadScenes(); RefreshAll(); } };
+
+        // Only scene changes matter here. Listening to projectChanged meant re-searching
+        // every scene in the project after any asset change anywhere, which stalled the
+        // editor for most of a second on each save in a large project.
+        SceneOrganizerScenes.Changed += OnScenesChanged;
+        SceneOrganizerUserState.RecentsChanged += OnRecentsChanged;
+        EditorSceneManager.sceneOpened += OnSceneOpened;
+        EditorSceneManager.sceneClosed += OnSceneClosed;
+        EditorSceneManager.newSceneCreated += OnNewSceneCreated;
     }
 
     private void OnDisable()
     {
-        EditorApplication.projectChanged -= OnProjectChanged;
+        SceneOrganizerScenes.Changed -= OnScenesChanged;
+        SceneOrganizerUserState.RecentsChanged -= OnRecentsChanged;
+        EditorSceneManager.sceneOpened -= OnSceneOpened;
+        EditorSceneManager.sceneClosed -= OnSceneClosed;
+        EditorSceneManager.newSceneCreated -= OnNewSceneCreated;
         pendingSave?.Pause();
 
         if (leftPane != null && leftPane.resolvedStyle.width > 50f)
             leftPaneWidth = leftPane.resolvedStyle.width;
 
         SaveSettings();
+        // This runs before every script recompile too: it writes only if something changed.
         SaveGroups();
     }
 
-    private void OnProjectChanged()
+    private void OnScenesChanged(IList<string> added, IList<string> deleted, IList<string> movedTo, IList<string> movedFrom)
     {
-        // Saving our own asset raises this too. Rebuilding the group cards here would
-        // destroy the list you are dragging, so only react when scenes really changed.
-        if (!SceneSetChanged())
-            return;
-
+        // Moves are followed into groups by the tracker; reload once it has done so.
         LoadScenes();
         RefreshAll();
+        if (movedTo.Count > 0)
+            EditorApplication.delayCall += () => { if (this != null) RefreshGroups(); };
     }
 
-    private bool SceneSetChanged()
+    private void OnRecentsChanged()
     {
-        string[] guids = AssetDatabase.FindAssets("t:Scene");
+        if (sortMode == SceneSortMode.RecentlyUsed)
+            SortScenes();
 
-        if (guids.Length != knownScenePaths.Count)
-            return true;
+        RefreshSceneList();
+    }
 
-        foreach (string guid in guids)
+    private void OnSceneOpened(UnityEngine.SceneManagement.Scene scene, OpenSceneMode mode) => RefreshOpenMarks();
+    private void OnSceneClosed(UnityEngine.SceneManagement.Scene scene) => RefreshOpenMarks();
+    private void OnNewSceneCreated(UnityEngine.SceneManagement.Scene scene, NewSceneSetup setup, NewSceneMode mode) => RefreshOpenMarks();
+
+    /// <summary>Re-binds the rows so the scenes open right now are marked.</summary>
+    private void RefreshOpenMarks()
+    {
+        CollectOpenScenes();
+        sceneList?.RefreshItems();
+        recentList?.RefreshItems();
+        if (groupsScroll != null)
+            groupsScroll.Query<ListView>().ForEach(list => list.RefreshItems());
+    }
+
+    private void CollectOpenScenes()
+    {
+        openScenes.Clear();
+        for (int i = 0; i < EditorSceneManager.sceneCount; i++)
         {
-            if (!knownScenePaths.Contains(AssetDatabase.GUIDToAssetPath(guid)))
-                return true;
+            string path = EditorSceneManager.GetSceneAt(i).path;
+            if (!string.IsNullOrEmpty(path))
+                openScenes.Add(path);
         }
-
-        return false;
     }
 
     /// <summary>
@@ -181,10 +227,13 @@ public class SceneOrganizerWindow : EditorWindow
         RefreshAll();
     }
 
-    private StyleSheet LoadStyleSheet()
+    private StyleSheet LoadStyleSheet() => LoadStyleSheetNextTo(this);
+
+    /// <summary>The organizer's stylesheet, found beside <paramref name="owner"/>'s script (any window in this folder).</summary>
+    internal static StyleSheet LoadStyleSheetNextTo(ScriptableObject owner)
     {
-        // Resolved next to this script so the package can be moved or renamed freely.
-        var script = MonoScript.FromScriptableObject(this);
+        // Resolved next to the script so the package can be moved or renamed freely.
+        var script = MonoScript.FromScriptableObject(owner);
         string scriptPath = script != null ? AssetDatabase.GetAssetPath(script) : null;
 
         if (!string.IsNullOrEmpty(scriptPath))
@@ -211,10 +260,15 @@ public class SceneOrganizerWindow : EditorWindow
         var create = new ToolbarButton(() => CreateNewSceneWindow.ShowWindow(this)) { text = "Create Scene" };
         toolbar.Add(create);
 
-        var refresh = new ToolbarButton(() => { LoadScenes(); RefreshAll(); }) { text = "Refresh" };
+        // The list follows the project by itself; this rescans from scratch in case it ever drifts.
+        var refresh = new ToolbarButton(() => { SceneOrganizerScenes.Rescan(); LoadScenes(); RefreshAll(); })
+        {
+            text = "Refresh",
+            tooltip = "Rescan the project for scenes",
+        };
         toolbar.Add(refresh);
 
-        var search = new ToolbarSearchField();
+        var search = new ToolbarSearchField { placeholderText = "Search scenes" };
         search.AddToClassList("so-search");
         search.tooltip = "Filter scenes by name or path";
         search.RegisterValueChangedCallback(evt =>
@@ -249,7 +303,7 @@ public class SceneOrganizerWindow : EditorWindow
         });
         toolbar.Add(pathToggle);
 
-        var options = new ToolbarMenu { text = "⋮" };
+        var options = new ToolbarMenu { text = "Options", tooltip = "Scene Organizer options" };
         options.menu.AppendAction("Show Recent Scenes",
             _ => { showRecentScenes = !showRecentScenes; SaveSettings(); RefreshSceneList(); },
             _ => showRecentScenes ? DropdownMenuAction.Status.Checked : DropdownMenuAction.Status.Normal);
@@ -336,25 +390,29 @@ public class SceneOrganizerWindow : EditorWindow
         if (isRecent)
             row.AddToClassList("so-row--recent");
 
-        var icon = new Image { name = "icon", scaleMode = ScaleMode.ScaleToFit };
-        icon.AddToClassList("so-row__icon");
-        row.Add(icon);
+        var parts = new SceneRow();
+        row.userData = parts;
 
-        var name = new Label { name = "name" };
-        name.AddToClassList("so-row__name");
-        row.Add(name);
+        parts.Icon = new Image { scaleMode = ScaleMode.ScaleToFit };
+        parts.Icon.AddToClassList("so-row__icon");
+        row.Add(parts.Icon);
 
-        var note = new Label { name = "note", text = "\U0001F4DD" };
-        note.AddToClassList("so-row__note");
-        row.Add(note);
+        parts.Name = new Label();
+        parts.Name.AddToClassList("so-row__name");
+        row.Add(parts.Name);
+
+        // An editor icon rather than an emoji, which the editor font may not have.
+        parts.Note = new Image { scaleMode = ScaleMode.ScaleToFit, image = NoteIcon };
+        parts.Note.AddToClassList("so-row__note");
+        row.Add(parts.Note);
 
         var spacer = new VisualElement();
         spacer.AddToClassList("so-row__spacer");
         row.Add(spacer);
 
-        var path = new Label { name = "path" };
-        path.AddToClassList("so-row__path");
-        row.Add(path);
+        parts.Location = new Label();
+        parts.Location.AddToClassList("so-row__path");
+        row.Add(parts.Location);
 
         // Drag out to a group. A plain click must not start one, hence the threshold.
         row.RegisterCallback<PointerDownEvent>(evt =>
@@ -377,10 +435,10 @@ public class SceneOrganizerWindow : EditorWindow
 
         row.AddManipulator(new ContextualMenuManipulator(evt =>
         {
-            if (!(row.userData is int sceneIndex) || sceneIndex < 0 || sceneIndex >= allScenes.Count)
+            if (parts.SceneIndex < 0 || parts.SceneIndex >= allScenes.Count)
                 return;
 
-            BuildSceneContextMenu(evt.menu, allScenes[sceneIndex].Path);
+            BuildSceneContextMenu(evt.menu, allScenes[parts.SceneIndex].Path);
         }));
 
         return row;
@@ -388,7 +446,7 @@ public class SceneOrganizerWindow : EditorWindow
 
     private void BindSceneRow(VisualElement element, List<int> source, int index, bool isRecent)
     {
-        if (index < 0 || index >= source.Count)
+        if (index < 0 || index >= source.Count || !(element.userData is SceneRow parts))
             return;
 
         int sceneIndex = source[index];
@@ -396,25 +454,32 @@ public class SceneOrganizerWindow : EditorWindow
             return;
 
         SceneEntry entry = allScenes[sceneIndex];
-        element.userData = sceneIndex;
+        parts.SceneIndex = sceneIndex;
+        parts.Path = entry.Path;
 
-        var icon = element.Q<Image>("icon");
         if (sceneIconContent != null)
-            icon.image = sceneIconContent.image;
+            parts.Icon.image = sceneIconContent.image;
 
-        element.Q<Label>("name").text = entry.Name;
+        parts.Name.text = entry.Name;
 
-        var note = element.Q<Label>("note");
         bool hasNote = assetNotesData != null && assetNotesData.HasNote(entry.Path);
-        note.style.display = hasNote ? DisplayStyle.Flex : DisplayStyle.None;
-        note.tooltip = hasNote ? assetNotesData.GetNote(entry.Path) : null;
+        parts.Note.style.display = hasNote ? DisplayStyle.Flex : DisplayStyle.None;
+        parts.Note.tooltip = hasNote ? assetNotesData.GetNote(entry.Path) : null;
 
-        var path = element.Q<Label>("path");
-        path.style.display = showScenePath ? DisplayStyle.Flex : DisplayStyle.None;
-        path.text = showScenePath ? entry.Directory : null;
+        parts.Location.style.display = showScenePath ? DisplayStyle.Flex : DisplayStyle.None;
+        parts.Location.text = showScenePath ? entry.Directory : null;
 
-        element.tooltip = entry.Path;
+        bool open = openScenes.Contains(entry.Path);
+        element.EnableInClassList("so-row--open", open);
+        element.tooltip = open ? entry.Path + "\n(open)" : entry.Path;
     }
+
+    private static Texture noteIcon;
+    private static Texture NoteIcon => noteIcon != null ? noteIcon
+        : noteIcon = EditorGUIUtility.IconContent(EditorGUIUtility.isProSkin ? "d_editicon.sml" : "editicon.sml").image;
+
+    private static Texture menuIcon;
+    private static Texture MenuIcon => menuIcon != null ? menuIcon : menuIcon = EditorGUIUtility.IconContent("_Menu").image;
 
     private VisualElement BuildGroupPane()
     {
@@ -493,6 +558,7 @@ public class SceneOrganizerWindow : EditorWindow
             return;
 
         EnsureSceneIcon();
+        CollectOpenScenes();
         RebuildFilter();
         RebuildRecents();
 
@@ -562,7 +628,7 @@ public class SceneOrganizerWindow : EditorWindow
                 return;
 
             group.isCollapsed = !evt.newValue;
-            EditorUtility.SetDirty(sceneGroupData);
+            MarkGroupsDirty();
 
             // The body is a sibling of the header, not a child of the foldout, so its
             // visibility has to be driven explicitly - otherwise the arrow turns and
@@ -644,9 +710,12 @@ public class SceneOrganizerWindow : EditorWindow
             header.Add(loadAll);
         }
 
-        var menu = new Button { text = "⋮", tooltip = "Group actions" };
+        var menu = new Button { tooltip = "Group actions" };
         menu.AddToClassList("so-btn");
         menu.AddToClassList("so-btn--icon");
+        var menuGlyph = new Image { image = MenuIcon, scaleMode = ScaleMode.ScaleToFit };
+        menuGlyph.AddToClassList("so-btn__glyph");
+        menu.Add(menuGlyph);
         menu.clicked += () => ShowGroupMenu(group, groupIndex, menu.worldBound);
         header.Add(menu);
 
@@ -696,53 +765,78 @@ public class SceneOrganizerWindow : EditorWindow
             var row = new VisualElement();
             row.AddToClassList("so-row");
 
-            var icon = new Image { name = "icon", scaleMode = ScaleMode.ScaleToFit };
-            icon.AddToClassList("so-row__icon");
-            row.Add(icon);
+            var parts = new SceneRow();
+            row.userData = parts;
 
-            var name = new Label { name = "name" };
-            name.AddToClassList("so-row__name");
-            row.Add(name);
+            parts.Icon = new Image { scaleMode = ScaleMode.ScaleToFit };
+            parts.Icon.AddToClassList("so-row__icon");
+            row.Add(parts.Icon);
+
+            parts.Name = new Label();
+            parts.Name.AddToClassList("so-row__name");
+            row.Add(parts.Name);
 
             var spacer = new VisualElement();
             spacer.AddToClassList("so-row__spacer");
             row.Add(spacer);
 
-            var open = new Button { name = "open", text = "Open", tooltip = "Open this scene (closes the others)" };
-            open.AddToClassList("so-btn");
-            row.Add(open);
+            // One handler each, reading the row's current scene: binding (which happens on
+            // every scroll and refresh) then only swaps a string.
+            parts.Open = new Button(() => { if (parts.Path != null) OpenScene(parts.Path); })
+            {
+                text = "Open",
+                tooltip = "Open this scene on its own (right-click for more)",
+            };
+            parts.Open.AddToClassList("so-btn");
+            row.Add(parts.Open);
 
-            var remove = new Button { name = "remove", text = "×", tooltip = "Remove from group" };
-            remove.AddToClassList("so-btn");
-            remove.AddToClassList("so-btn--icon");
-            row.Add(remove);
+            parts.Remove = new Button(() => { if (parts.Path != null) RemoveFromGroup(group, parts.Path); })
+            {
+                text = "×",
+                tooltip = "Remove from group",
+            };
+            parts.Remove.AddToClassList("so-btn");
+            parts.Remove.AddToClassList("so-btn--icon");
+            row.Add(parts.Remove);
+
+            row.AddManipulator(new ContextualMenuManipulator(evt =>
+            {
+                string path = parts.Path;
+                if (path == null)
+                    return;
+
+                evt.menu.AppendAction("Open", _ => OpenScene(path));
+                evt.menu.AppendAction("Open Additive", _ => OpenSceneAdditive(path));
+                evt.menu.AppendSeparator();
+                evt.menu.AppendAction("Show in Project", _ =>
+                    EditorGUIUtility.PingObject(AssetDatabase.LoadAssetAtPath<SceneAsset>(path)));
+                evt.menu.AppendAction("Remove from Group", _ => RemoveFromGroup(group, path));
+            }));
 
             return row;
         };
 
         list.bindItem = (element, index) =>
         {
-            if (index < 0 || index >= group.scenes.Count)
+            if (index < 0 || index >= group.scenes.Count || !(element.userData is SceneRow parts))
                 return;
 
             string path = group.scenes[index];
-            element.tooltip = path;
+            parts.Path = path;
 
             if (sceneIconContent != null)
-                element.Q<Image>("icon").image = sceneIconContent.image;
+                parts.Icon.image = sceneIconContent.image;
 
-            element.Q<Label>("name").text = Path.GetFileNameWithoutExtension(path);
+            parts.Name.text = Path.GetFileNameWithoutExtension(path);
 
-            var open = element.Q<Button>("open");
-            open.clickable = new Clickable(() => OpenScene(path));
-
-            var remove = element.Q<Button>("remove");
-            remove.clickable = new Clickable(() =>
-            {
-                group.scenes.Remove(path);
-                MarkGroupsDirty();
-                RefreshGroups();
-            });
+            bool open = openScenes.Contains(path);
+            bool missing = IsMissing(path);
+            element.EnableInClassList("so-row--open", open);
+            element.EnableInClassList("so-row--missing", missing);
+            parts.Open.SetEnabled(!missing);
+            parts.Name.text = missing ? parts.Name.text + "  (missing)" : parts.Name.text;
+            element.tooltip = missing ? "Not found: " + path + "\nRemove it with ×, or put the scene back."
+                : open ? path + "\n(open)" : path;
         };
 
         list.itemIndexChanged += (_, __) => MarkGroupsDirty();
@@ -940,8 +1034,8 @@ public class SceneOrganizerWindow : EditorWindow
 
         if (paths.Count == 0)
         {
-            EditorUtility.DisplayDialog("Nothing Selected",
-                "Select one or more scenes in the left pane first.", "OK");
+            // A passing note in the window, not a dialog to click away.
+            ShowNotification(new GUIContent("Select scenes on the left first"), 1.5);
             return;
         }
 
@@ -962,6 +1056,18 @@ public class SceneOrganizerWindow : EditorWindow
         }
 
         if (added == 0)
+        {
+            ShowNotification(new GUIContent(paths.Count == 1 ? "Already in " + group.groupName : "All already in " + group.groupName), 1.5);
+            return;
+        }
+
+        MarkGroupsDirty();
+        RefreshGroups();
+    }
+
+    private void RemoveFromGroup(SceneGroupData.SceneGroup group, string path)
+    {
+        if (!group.scenes.Remove(path))
             return;
 
         MarkGroupsDirty();
@@ -973,7 +1079,7 @@ public class SceneOrganizerWindow : EditorWindow
     private void BuildSceneContextMenu(DropdownMenu menu, string scenePath)
     {
         menu.AppendAction("Open", _ => OpenScene(scenePath));
-        menu.AppendAction("Open Additive", _ => EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Additive));
+        menu.AppendAction("Open Additive", _ => OpenSceneAdditive(scenePath));
         menu.AppendSeparator();
 
         var selected = GetSelectedScenePaths();
@@ -1103,11 +1209,10 @@ public class SceneOrganizerWindow : EditorWindow
         allScenes.Clear();
         knownScenePaths.Clear();
 
-        string[] sceneGUIDs = AssetDatabase.FindAssets("t:Scene");
-        foreach (string guid in sceneGUIDs)
+        // Kept current by SceneOrganizerScenes, so this costs nothing after the first time.
+        foreach (string path in SceneOrganizerScenes.All)
         {
-            string path = AssetDatabase.GUIDToAssetPath(guid);
-            if (string.IsNullOrEmpty(path))
+            if (string.IsNullOrEmpty(path) || !knownScenePaths.Add(path))
                 continue;
 
             string name = Path.GetFileNameWithoutExtension(path);
@@ -1119,7 +1224,6 @@ public class SceneOrganizerWindow : EditorWindow
                 LowerName = name.ToLowerInvariant(),
                 LowerPath = path.ToLowerInvariant(),
             });
-            knownScenePaths.Add(path);
         }
 
         SortScenes();
@@ -1128,22 +1232,18 @@ public class SceneOrganizerWindow : EditorWindow
     }
 
     /// <summary>
-    /// Drops references to scenes that no longer exist, at load time rather than as a
-    /// File.Exists per row per repaint.
+    /// Drops recents that no longer exist. Groups are never trimmed automatically: a scene
+    /// that can't be found shows as missing in its group until it is removed by hand, so a
+    /// scan made too early (mid-reload, before a package imports) can't wipe out a group.
     /// </summary>
     private void PruneMissingScenes()
     {
-        if (sceneGroupData == null)
-            return;
-
-        int removed = sceneGroupData.recentScenes.RemoveAll(s => !knownScenePaths.Contains(s));
-
-        foreach (var group in sceneGroupData.sceneGroups)
-            removed += group.scenes.RemoveAll(s => !knownScenePaths.Contains(s));
-
-        if (removed > 0)
-            EditorUtility.SetDirty(sceneGroupData);
+        if (knownScenePaths.Count > 0)
+            SceneOrganizerUserState.instance.Prune(knownScenePaths);
     }
+
+    /// <summary>True for a grouped scene that isn't in the project (deleted, or not imported yet).</summary>
+    private bool IsMissing(string path) => knownScenePaths.Count > 0 && !knownScenePaths.Contains(path);
 
     private void SetSortMode(SceneSortMode mode)
     {
@@ -1188,13 +1288,14 @@ public class SceneOrganizerWindow : EditorWindow
         InvalidateFilter();
     }
 
-    private int RecentRank(string path)
+    private static int RecentRank(string path)
     {
-        if (sceneGroupData == null)
-            return int.MaxValue;
+        var recents = SceneOrganizerUserState.instance.RecentScenes;
+        for (int i = 0; i < recents.Count; i++)
+            if (recents[i] == path)
+                return i;
 
-        int index = sceneGroupData.recentScenes.IndexOf(path);
-        return index < 0 ? int.MaxValue : index;
+        return int.MaxValue;
     }
 
     private void InvalidateFilter()
@@ -1235,12 +1336,10 @@ public class SceneOrganizerWindow : EditorWindow
     {
         recentScenes.Clear();
 
-        if (sceneGroupData == null)
-            return;
-
-        for (int i = 0; i < sceneGroupData.recentScenes.Count && recentScenes.Count < 5; i++)
+        var recents = SceneOrganizerUserState.instance.RecentScenes;
+        for (int i = 0; i < recents.Count && recentScenes.Count < 5; i++)
         {
-            if (sceneIndexByPath.TryGetValue(sceneGroupData.recentScenes[i], out int index))
+            if (sceneIndexByPath.TryGetValue(recents[i], out int index))
                 recentScenes.Add(index);
         }
     }
@@ -1297,6 +1396,13 @@ public class SceneOrganizerWindow : EditorWindow
         if (group == null)
             return;
 
+        // Groups are looked up by name, so two with the same one would trip each other up.
+        if (sceneGroupData.sceneGroups.Exists(g => g != group && g.groupName == newName))
+        {
+            ShowNotification(new GUIContent("There's already a group called " + newName), 2);
+            return;
+        }
+
         group.groupName = newName;
         MarkGroupsDirty();
     }
@@ -1309,13 +1415,10 @@ public class SceneOrganizerWindow : EditorWindow
         string error = AssetDatabase.RenameAsset(oldScenePath, newSceneName);
 
         if (!string.IsNullOrEmpty(error))
-        {
             EditorUtility.DisplayDialog("Rename Failed", error, "OK");
-            return;
-        }
 
-        AssetDatabase.SaveAssets();
-        LoadScenes();
+        // The rename arrives as a move: SceneOrganizerScenes updates the list and the
+        // groups and recents that held the old path. No project-wide save needed.
     }
 
     private void RemoveGroup(SceneGroupData.SceneGroup group)
@@ -1330,14 +1433,14 @@ public class SceneOrganizerWindow : EditorWindow
         if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo())
             return;
 
+        // The recents follow through EditorSceneManager.sceneOpened (SceneOrganizerUserState),
+        // into the user's own settings: opening a scene no longer rewrites the shared groups asset.
         EditorSceneManager.OpenScene(scenePath);
-        sceneGroupData.AddToRecent(scenePath);
-        MarkGroupsDirty();
+    }
 
-        if (sortMode == SceneSortMode.RecentlyUsed)
-            SortScenes();
-
-        RefreshSceneList();
+    private static void OpenSceneAdditive(string scenePath)
+    {
+        EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Additive);
     }
 
     private void LoadAllScenesInGroup(SceneGroupData.SceneGroup group)
@@ -1397,7 +1500,7 @@ public class SceneOrganizerWindow : EditorWindow
     private void LoadSettings()
     {
         enableBackup = EditorPrefs.GetBool(SceneOrganizerConstants.PREF_ENABLE_BACKUP, false);
-        backupDirectory = EditorPrefs.GetString(SceneOrganizerConstants.PREF_BACKUP_DIR, Application.dataPath);
+        backupDirectory = EditorPrefs.GetString(SceneOrganizerConstants.PREF_BACKUP_DIR, SceneOrganizerConstants.DefaultBackupDirectory);
         showRecentScenes = EditorPrefs.GetBool(SceneOrganizerConstants.PREF_SHOW_RECENT, true);
         showScenePath = EditorPrefs.GetBool("SceneOrganizer_ShowPath", false);
         sortMode = (SceneSortMode)EditorPrefs.GetInt("SceneOrganizer_SortMode", 0);
@@ -1423,9 +1526,9 @@ public class SceneOrganizerWindow : EditorWindow
         if (!AssetDatabase.IsValidFolder("Assets/Editor"))
             AssetDatabase.CreateFolder("Assets", "Editor");
 
+        // CreateAsset writes the file itself; nothing else needs saving.
         assetNotesData = CreateInstance<AssetNotesData>();
         AssetDatabase.CreateAsset(assetNotesData, assetPath);
-        AssetDatabase.SaveAssets();
     }
 
     public void LoadGroups()
@@ -1462,7 +1565,6 @@ public class SceneOrganizerWindow : EditorWindow
             EnsureAssetFolder();
             sceneGroupData = CreateInstance<SceneGroupData>();
             AssetDatabase.CreateAsset(sceneGroupData, SceneOrganizerConstants.ASSET_PATH);
-            AssetDatabase.SaveAssets();
         }
         catch (Exception ex)
         {
@@ -1470,15 +1572,19 @@ public class SceneOrganizerWindow : EditorWindow
         }
     }
 
+    /// <summary>
+    /// Writes the groups asset, and only that asset, if it has unsaved changes. This runs
+    /// before every script recompile (OnDisable): AssetDatabase.SaveAssets here used to write
+    /// every dirty asset in the project, and back up identical copies, each time.
+    /// </summary>
     private void SaveGroups()
     {
         pendingSave?.Pause();
 
-        if (sceneGroupData == null)
+        if (sceneGroupData == null || !EditorUtility.IsDirty(sceneGroupData))
             return;
 
-        EditorUtility.SetDirty(sceneGroupData);
-        AssetDatabase.SaveAssets();
+        AssetDatabase.SaveAssetIfDirty(sceneGroupData);
 
         if (enableBackup && !string.IsNullOrEmpty(backupDirectory))
             BackupGroups();
@@ -1790,7 +1896,7 @@ public class SceneOrganizerWindow : EditorWindow
                 {
                     notesData.SetNote(scenePath, noteText);
                     EditorUtility.SetDirty(notesData);
-                    AssetDatabase.SaveAssets();
+                    AssetDatabase.SaveAssetIfDirty(notesData);
                     parentWindow?.RefreshSceneList();
                 }
 

@@ -82,9 +82,11 @@
 }
 
 .so-row__note {
+    width: 12px;
+    height: 12px;
     flex-shrink: 0;
     margin-left: 5px;
-    font-size: 11px;
+    opacity: 0.8;
 }
 
 .so-row__spacer {
@@ -102,9 +104,30 @@
     -unity-text-align: middle-right;
 }
 
-/* Recents get a tint so they read as a different section at a glance. */
+/* Recents get a tint so they read as a different section at a glance; the theme's link
+   colour keeps it readable on the light skin as well as the dark one. */
 .so-row--recent .so-row__name {
-    color: rgb(150, 195, 255);
+    color: var(--unity-colors-link-text);
+}
+
+/* A scene open in the editor right now: bold, with an accent bar on its left edge. */
+.so-row--open {
+    border-left-width: 2px;
+    border-left-color: var(--unity-colors-highlight-background);
+    padding-left: 4px;
+}
+
+.so-row--open .so-row__name {
+    -unity-font-style: bold;
+}
+
+/* A grouped scene that isn't in the project any more (kept until removed by hand). */
+.so-row--missing {
+    opacity: 0.5;
+}
+
+.so-row--missing .so-row__name {
+    -unity-font-style: italic;
 }
 
 .unity-collection-view__item--selected .so-row__name,
@@ -258,6 +281,14 @@
     padding-left: 0;
     padding-right: 0;
     -unity-text-align: middle-center;
+    align-items: center;
+    justify-content: center;
+}
+
+/* An editor icon inside an icon button (the group menu). */
+.so-btn__glyph {
+    width: 14px;
+    height: 14px;
 }
 
 .so-swatch {
@@ -340,4 +371,142 @@
     border-right-color: var(--unity-colors-default-text);
     border-top-color: var(--unity-colors-default-text);
     border-bottom-color: var(--unity-colors-default-text);
+}
+
+/* -------------------------------------------------------- create scene dialog */
+
+.so-dialog {
+    padding-left: 12px;
+    padding-right: 12px;
+    padding-top: 8px;
+    padding-bottom: 10px;
+}
+
+.so-section-title {
+    -unity-font-style: bold;
+    font-size: 11px;
+    color: var(--unity-colors-input_field_placeholder-text);
+    margin-left: 3px;
+    margin-bottom: 4px;
+}
+
+.so-templates {
+    flex-direction: row;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+}
+
+.so-template {
+    width: 112px;
+    margin-right: 8px;
+    margin-bottom: 6px;
+    padding-left: 4px;
+    padding-right: 4px;
+    padding-top: 4px;
+    padding-bottom: 6px;
+    border-radius: 5px;
+    border-left-width: 2px;
+    border-right-width: 2px;
+    border-top-width: 2px;
+    border-bottom-width: 2px;
+    border-left-color: var(--unity-colors-default-border);
+    border-right-color: var(--unity-colors-default-border);
+    border-top-color: var(--unity-colors-default-border);
+    border-bottom-color: var(--unity-colors-default-border);
+    background-color: var(--unity-colors-default-background);
+    transition-property: border-color, background-color;
+    transition-duration: 90ms;
+}
+
+.so-template:hover {
+    background-color: var(--unity-colors-button-background-hover);
+}
+
+.so-template--selected {
+    border-left-color: var(--unity-colors-highlight-background);
+    border-right-color: var(--unity-colors-highlight-background);
+    border-top-color: var(--unity-colors-highlight-background);
+    border-bottom-color: var(--unity-colors-highlight-background);
+    background-color: var(--unity-colors-highlight-background-inactive);
+}
+
+.so-template__thumb {
+    height: 66px;
+    border-radius: 3px;
+    background-color: rgba(0, 0, 0, 0.18);
+}
+
+/* Unity's own setups show the scene icon small in the middle rather than a picture. */
+.so-template--builtin .so-template__thumb {
+    padding-left: 28px;
+    padding-right: 28px;
+    padding-top: 12px;
+    padding-bottom: 12px;
+}
+
+.so-template__title {
+    margin-top: 5px;
+    font-size: 12px;
+    -unity-text-align: middle-center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--unity-colors-default-text);
+}
+
+.so-template--selected .so-template__title {
+    -unity-font-style: bold;
+}
+
+.so-form-field {
+    margin-bottom: 4px;
+}
+
+.so-form-field > .unity-base-field__label {
+    min-width: 110px;
+}
+
+.so-form-row {
+    flex-direction: row;
+    align-items: center;
+}
+
+.so-form-row__grow {
+    flex-grow: 1;
+    flex-shrink: 1;
+}
+
+.so-form-row .so-btn {
+    margin-bottom: 4px;
+}
+
+.so-result {
+    margin-top: 8px;
+    margin-left: 3px;
+    font-size: 11px;
+    white-space: normal;
+    color: var(--unity-colors-input_field_placeholder-text);
+}
+
+.so-result--warn {
+    color: rgb(230, 175, 60);
+}
+
+.so-result--error {
+    color: rgb(235, 100, 90);
+}
+
+.so-dialog__buttons {
+    flex-direction: row;
+    justify-content: flex-end;
+}
+
+.so-dialog__button {
+    min-width: 84px;
+    height: 24px;
+    margin-left: 6px;
+}
+
+.so-dialog__button--primary {
+    -unity-font-style: bold;
 }

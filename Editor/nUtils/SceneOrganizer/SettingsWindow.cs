@@ -8,29 +8,30 @@ public class SettingsWindow : EditorWindow
     private SceneOrganizerWindow organizerWindow;
     private bool enableBackup;
     private string backupDirectory;
-    private string[] backupFiles;
+    private string[] backupFiles = new string[0];
+    // Shown beside each backup; read once per listing rather than on every repaint.
+    private string[] backupDates = new string[0];
     private Vector2 scrollPosition;
     private int selectedBackupIndex = -1;
 
     public static void ShowWindow(SceneOrganizerWindow window)
     {
-        SettingsWindow settingsWindow = GetWindow<SettingsWindow>("Settings", true);
+        SettingsWindow settingsWindow = GetWindow<SettingsWindow>(true, "Scene Organizer Settings", true);
         settingsWindow.organizerWindow = window;
-        settingsWindow.minSize = new Vector2(400, 300);
-        settingsWindow.maxSize = new Vector2(400, 600);
+        settingsWindow.minSize = new Vector2(420, 320);
+        settingsWindow.maxSize = new Vector2(600, 640);
     }
 
     private void OnEnable()
     {
         enableBackup = EditorPrefs.GetBool(SceneOrganizerConstants.PREF_ENABLE_BACKUP, false);
-        backupDirectory = EditorPrefs.GetString(SceneOrganizerConstants.PREF_BACKUP_DIR, Application.dataPath);
+        backupDirectory = EditorPrefs.GetString(SceneOrganizerConstants.PREF_BACKUP_DIR, SceneOrganizerConstants.DefaultBackupDirectory);
         LoadBackupFiles();
     }
 
     private void OnGUI()
     {
-        GUILayout.Label("Scene Organizer Settings", EditorStyles.boldLabel);
-        EditorGUILayout.Space();
+        GUILayout.Label("Backups", EditorStyles.boldLabel);
 
         DrawBackupSettings();
         EditorGUILayout.Space();
@@ -42,85 +43,88 @@ public class SettingsWindow : EditorWindow
 
     private void DrawBackupSettings()
     {
-        EditorGUILayout.LabelField("Backup Settings", EditorStyles.boldLabel);
+        enableBackup = EditorGUILayout.ToggleLeft(
+            new GUIContent("Back up groups automatically", "Keep a copy of your scene groups each time they change."),
+            enableBackup);
 
-        enableBackup = EditorGUILayout.Toggle("Enable Automatic Backup", enableBackup);
-
-        if (enableBackup)
+        EditorGUILayout.BeginHorizontal();
+        EditorGUILayout.LabelField("Folder", GUILayout.Width(50));
+        EditorGUILayout.SelectableLabel(backupDirectory, EditorStyles.textField, GUILayout.Height(EditorGUIUtility.singleLineHeight));
+        if (GUILayout.Button("Browse…", GUILayout.Width(70)))
         {
-            EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField("Backup Directory:");
-            if (GUILayout.Button("Browse", GUILayout.Width(70)))
+            string path = EditorUtility.OpenFolderPanel("Select Backup Folder", backupDirectory, "");
+            if (!string.IsNullOrEmpty(path))
             {
-                string path = EditorUtility.OpenFolderPanel("Select Backup Directory", backupDirectory, "");
-                if (!string.IsNullOrEmpty(path))
-                {
-                    backupDirectory = path;
-                    LoadBackupFiles();
-                }
+                backupDirectory = path;
+                LoadBackupFiles();
             }
-            EditorGUILayout.EndHorizontal();
+        }
+        EditorGUILayout.EndHorizontal();
 
-            EditorGUILayout.HelpBox(backupDirectory, MessageType.None);
+        if (SceneOrganizerConstants.IsInsideAssets(backupDirectory))
+        {
             EditorGUILayout.HelpBox(
-                $"Backups are created automatically when groups are modified. " +
-                $"Maximum {SceneOrganizerConstants.MAX_BACKUP_COPIES} backups are kept.",
-                MessageType.Info);
+                "This folder is inside Assets, so Unity imports every backup as a new asset, which slows the editor. A folder outside Assets is better.",
+                MessageType.Warning);
+            if (GUILayout.Button("Use the project's UserSettings folder"))
+            {
+                backupDirectory = SceneOrganizerConstants.DefaultBackupDirectory;
+                LoadBackupFiles();
+            }
+        }
+        else if (enableBackup)
+        {
+            EditorGUILayout.HelpBox(
+                $"A copy is kept each time your groups change; the newest {SceneOrganizerConstants.MAX_BACKUP_COPIES} are kept.",
+                MessageType.None);
         }
     }
 
     private void DrawBackupList()
     {
-        EditorGUILayout.LabelField("Available Backups", EditorStyles.boldLabel);
+        EditorGUILayout.LabelField("Saved Backups", EditorStyles.boldLabel);
 
-        if (backupFiles == null || backupFiles.Length == 0)
+        if (backupFiles.Length == 0)
         {
-            EditorGUILayout.HelpBox("No backups available.", MessageType.Info);
+            EditorGUILayout.HelpBox("No backups in this folder yet.", MessageType.None);
             return;
         }
 
         scrollPosition = EditorGUILayout.BeginScrollView(scrollPosition, GUILayout.Height(150));
 
+        // Newest first; a click anywhere on a row picks it.
         for (int i = backupFiles.Length - 1; i >= 0; i--)
         {
-            EditorGUILayout.BeginHorizontal("box");
+            bool selected = selectedBackupIndex == i;
+            var rect = EditorGUILayout.BeginHorizontal(selected ? "SelectionRect" : "box");
+            GUILayout.Label(Path.GetFileName(backupFiles[i]), GUILayout.ExpandWidth(true));
+            GUILayout.Label(backupDates[i], EditorStyles.miniLabel, GUILayout.Width(110));
+            EditorGUILayout.EndHorizontal();
 
-            bool wasSelected = selectedBackupIndex == i;
-            bool isSelected = GUILayout.Toggle(wasSelected, "", GUILayout.Width(20));
-
-            if (isSelected && !wasSelected)
+            if (Event.current.type == EventType.MouseDown && rect.Contains(Event.current.mousePosition))
             {
                 selectedBackupIndex = i;
+                Event.current.Use();
             }
-
-            string fileName = Path.GetFileName(backupFiles[i]);
-            GUILayout.Label(fileName, GUILayout.ExpandWidth(true));
-
-            FileInfo fileInfo = new FileInfo(backupFiles[i]);
-            GUILayout.Label(fileInfo.LastWriteTime.ToString("yyyy-MM-dd HH:mm"),
-                EditorStyles.miniLabel, GUILayout.Width(120));
-
-            EditorGUILayout.EndHorizontal();
         }
 
         EditorGUILayout.EndScrollView();
 
-        if (selectedBackupIndex >= 0 && selectedBackupIndex < backupFiles.Length)
+        using (new EditorGUI.DisabledScope(selectedBackupIndex < 0 || selectedBackupIndex >= backupFiles.Length))
         {
             EditorGUILayout.BeginHorizontal();
             GUILayout.FlexibleSpace();
 
-            if (GUILayout.Button("Restore Selected Backup", GUILayout.Width(180)))
-            {
+            if (GUILayout.Button("Restore Selected", GUILayout.Width(130)))
                 RestoreFromBackup(backupFiles[selectedBackupIndex]);
-            }
 
-            if (GUILayout.Button("Delete", GUILayout.Width(60)))
+            if (GUILayout.Button("Delete", GUILayout.Width(70)))
             {
                 if (EditorUtility.DisplayDialog("Delete Backup",
-                    "Are you sure you want to delete this backup?", "Yes", "No"))
+                    $"Delete {Path.GetFileName(backupFiles[selectedBackupIndex])}?", "Delete", "Cancel"))
                 {
                     File.Delete(backupFiles[selectedBackupIndex]);
+                    selectedBackupIndex = -1;
                     LoadBackupFiles();
                 }
             }
@@ -133,21 +137,21 @@ public class SettingsWindow : EditorWindow
     {
         EditorGUILayout.BeginHorizontal();
 
-        if (GUILayout.Button("Create Backup Now"))
+        if (GUILayout.Button("Back Up Now", GUILayout.Width(110)))
         {
             CreateManualBackup();
         }
 
         GUILayout.FlexibleSpace();
 
-        if (GUILayout.Button("Save", GUILayout.Width(100)))
+        if (GUILayout.Button("Cancel", GUILayout.Width(90)))
         {
-            SaveSettings();
             Close();
         }
 
-        if (GUILayout.Button("Cancel", GUILayout.Width(100)))
+        if (GUILayout.Button("Save", GUILayout.Width(90)))
         {
+            SaveSettings();
             Close();
         }
 
@@ -161,12 +165,16 @@ public class SettingsWindow : EditorWindow
             if (string.IsNullOrEmpty(backupDirectory) || !Directory.Exists(backupDirectory))
             {
                 backupFiles = new string[0];
+                backupDates = new string[0];
                 selectedBackupIndex = -1;
                 return;
             }
 
             backupFiles = Directory.GetFiles(backupDirectory, "SceneGroupData_Backup_*.asset");
             Array.Sort(backupFiles);
+            backupDates = new string[backupFiles.Length];
+            for (int i = 0; i < backupFiles.Length; i++)
+                backupDates[i] = File.GetLastWriteTime(backupFiles[i]).ToString("yyyy-MM-dd HH:mm");
 
             if (selectedBackupIndex >= backupFiles.Length)
             {
@@ -177,6 +185,7 @@ public class SettingsWindow : EditorWindow
         {
             Debug.LogError($"Error loading backup files: {ex.Message}");
             backupFiles = new string[0];
+            backupDates = new string[0];
             selectedBackupIndex = -1;
         }
     }
@@ -188,13 +197,13 @@ public class SettingsWindow : EditorWindow
 
         if (!File.Exists(sourcePath))
         {
-            EditorUtility.DisplayDialog("Error", "No SceneGroupData found to backup.", "OK");
+            EditorUtility.DisplayDialog("Nothing to Back Up", "There are no scene groups saved yet.", "OK");
             return;
         }
 
         if (string.IsNullOrEmpty(backupDirectory))
         {
-            backupDirectory = Application.dataPath;
+            backupDirectory = SceneOrganizerConstants.DefaultBackupDirectory;
         }
 
         if (!Directory.Exists(backupDirectory))
@@ -210,11 +219,11 @@ public class SettingsWindow : EditorWindow
         {
             File.Copy(sourcePath, backupPath, true);
             LoadBackupFiles();
-            EditorUtility.DisplayDialog("Success", "Backup created successfully!", "OK");
+            ShowNotification(new GUIContent("Backed up"), 1.5);
         }
         catch (Exception ex)
         {
-            EditorUtility.DisplayDialog("Error", $"Failed to create backup: {ex.Message}", "OK");
+            EditorUtility.DisplayDialog("Backup Failed", $"Couldn't create the backup: {ex.Message}", "OK");
         }
     }
 
@@ -232,7 +241,7 @@ public class SettingsWindow : EditorWindow
     private void RestoreFromBackup(string backupPath)
     {
         if (!EditorUtility.DisplayDialog("Restore Backup",
-            "This will overwrite your current scene groups. Are you sure?", "Yes", "No"))
+            "This replaces your current scene groups with the backup. Continue?", "Restore", "Cancel"))
         {
             return;
         }
@@ -243,18 +252,19 @@ public class SettingsWindow : EditorWindow
                 SceneOrganizerConstants.ASSET_PATH));
 
             File.Copy(backupPath, targetPath, true);
-            AssetDatabase.Refresh();
+            // Only this one file changed: reimport it rather than refreshing the whole project.
+            AssetDatabase.ImportAsset(SceneOrganizerConstants.ASSET_PATH, ImportAssetOptions.ForceUpdate);
 
             if (organizerWindow != null)
             {
                 organizerWindow.LoadGroups();
             }
 
-            EditorUtility.DisplayDialog("Success", "Backup restored successfully!", "OK");
+            ShowNotification(new GUIContent("Restored"), 1.5);
         }
         catch (Exception ex)
         {
-            EditorUtility.DisplayDialog("Error", $"Failed to restore backup: {ex.Message}", "OK");
+            EditorUtility.DisplayDialog("Restore Failed", $"Couldn't restore the backup: {ex.Message}", "OK");
         }
     }
 }
