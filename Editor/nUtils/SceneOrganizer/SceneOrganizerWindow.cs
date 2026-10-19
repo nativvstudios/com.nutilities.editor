@@ -30,8 +30,9 @@ public class SceneOrganizerWindow : EditorWindow
     private readonly List<SceneEntry> allScenes = new List<SceneEntry>();
     private readonly Dictionary<string, int> sceneIndexByPath = new Dictionary<string, int>(StringComparer.Ordinal);
     private readonly HashSet<string> knownScenePaths = new HashSet<string>(StringComparer.Ordinal);
-    // Scenes loaded in the editor right now, marked in the lists.
+    // Scenes loaded in the editor right now, marked in the lists, and the one being edited.
     private readonly HashSet<string> openScenes = new HashSet<string>(StringComparer.Ordinal);
+    private string activeScenePath;
 
     /// <summary>A scene row's parts, found once when the row is made rather than on every bind.</summary>
     private sealed class SceneRow
@@ -42,6 +43,7 @@ public class SceneOrganizerWindow : EditorWindow
         public Label Name;
         public Image Note;
         public Label Location;
+        public Label Badge;
         public Button Open;
         public Button Remove;
     }
@@ -116,6 +118,7 @@ public class SceneOrganizerWindow : EditorWindow
         EditorSceneManager.sceneOpened += OnSceneOpened;
         EditorSceneManager.sceneClosed += OnSceneClosed;
         EditorSceneManager.newSceneCreated += OnNewSceneCreated;
+        EditorApplication.update += WatchActiveScene;
     }
 
     private void OnDisable()
@@ -125,6 +128,7 @@ public class SceneOrganizerWindow : EditorWindow
         EditorSceneManager.sceneOpened -= OnSceneOpened;
         EditorSceneManager.sceneClosed -= OnSceneClosed;
         EditorSceneManager.newSceneCreated -= OnNewSceneCreated;
+        EditorApplication.update -= WatchActiveScene;
         pendingSave?.Pause();
 
         if (leftPane != null && leftPane.resolvedStyle.width > 50f)
@@ -156,6 +160,15 @@ public class SceneOrganizerWindow : EditorWindow
     private void OnSceneClosed(UnityEngine.SceneManagement.Scene scene) => RefreshOpenMarks();
     private void OnNewSceneCreated(UnityEngine.SceneManagement.Scene scene, NewSceneSetup setup, NewSceneMode mode) => RefreshOpenMarks();
 
+    // The editor has no event for "Set Active Scene": look twice a second (a string compare).
+    private double nextActiveCheck;
+    private void WatchActiveScene()
+    {
+        if (EditorApplication.timeSinceStartup < nextActiveCheck) return;
+        nextActiveCheck = EditorApplication.timeSinceStartup + 0.5;
+        if (EditorSceneManager.GetActiveScene().path != activeScenePath) RefreshOpenMarks();
+    }
+
     /// <summary>Re-binds the rows so the scenes open right now are marked.</summary>
     private void RefreshOpenMarks()
     {
@@ -175,6 +188,29 @@ public class SceneOrganizerWindow : EditorWindow
             if (!string.IsNullOrEmpty(path))
                 openScenes.Add(path);
         }
+        activeScenePath = EditorSceneManager.GetActiveScene().path;
+    }
+
+    /// <summary>
+    /// Marks a row whose scene is open: tinted with an accent bar, and a pill saying so. With one scene open it reads
+    /// "Open"; with several, the one being edited reads "Active" and the others "Loaded".
+    /// </summary>
+    private void MarkOpen(VisualElement row, SceneRow parts, string path)
+    {
+        bool open = path != null && openScenes.Contains(path);
+        bool active = open && path == activeScenePath;
+        bool several = openScenes.Count > 1;
+        row.EnableInClassList("so-row--open", open);
+        row.EnableInClassList("so-row--active", active);
+        if (parts.Badge == null)
+            return;
+
+        parts.Badge.style.display = open ? DisplayStyle.Flex : DisplayStyle.None;
+        parts.Badge.text = !several ? "Open" : active ? "Active" : "Loaded";
+        parts.Badge.EnableInClassList("so-badge--loaded", open && !active);
+        parts.Badge.tooltip = !several ? "Open in the editor"
+            : active ? "The active scene: what you're editing, and where new objects go"
+            : "Loaded alongside the active scene";
     }
 
     /// <summary>
@@ -406,6 +442,10 @@ public class SceneOrganizerWindow : EditorWindow
         parts.Note.AddToClassList("so-row__note");
         row.Add(parts.Note);
 
+        parts.Badge = new Label();
+        parts.Badge.AddToClassList("so-badge");
+        row.Add(parts.Badge);
+
         var spacer = new VisualElement();
         spacer.AddToClassList("so-row__spacer");
         row.Add(spacer);
@@ -469,9 +509,8 @@ public class SceneOrganizerWindow : EditorWindow
         parts.Location.style.display = showScenePath ? DisplayStyle.Flex : DisplayStyle.None;
         parts.Location.text = showScenePath ? entry.Directory : null;
 
-        bool open = openScenes.Contains(entry.Path);
-        element.EnableInClassList("so-row--open", open);
-        element.tooltip = open ? entry.Path + "\n(open)" : entry.Path;
+        MarkOpen(element, parts, entry.Path);
+        element.tooltip = openScenes.Contains(entry.Path) ? entry.Path + "\n(open)" : entry.Path;
     }
 
     private static Texture noteIcon;
@@ -776,6 +815,10 @@ public class SceneOrganizerWindow : EditorWindow
             parts.Name.AddToClassList("so-row__name");
             row.Add(parts.Name);
 
+            parts.Badge = new Label();
+            parts.Badge.AddToClassList("so-badge");
+            row.Add(parts.Badge);
+
             var spacer = new VisualElement();
             spacer.AddToClassList("so-row__spacer");
             row.Add(spacer);
@@ -831,9 +874,12 @@ public class SceneOrganizerWindow : EditorWindow
 
             bool open = openScenes.Contains(path);
             bool missing = IsMissing(path);
-            element.EnableInClassList("so-row--open", open);
+            MarkOpen(element, parts, path);
             element.EnableInClassList("so-row--missing", missing);
-            parts.Open.SetEnabled(!missing);
+            // Already the only scene open: opening it again would do nothing.
+            bool alreadyOpen = open && path == activeScenePath && openScenes.Count == 1;
+            parts.Open.SetEnabled(!missing && !alreadyOpen);
+            parts.Open.tooltip = alreadyOpen ? "Already open" : "Open this scene on its own (right-click for more)";
             parts.Name.text = missing ? parts.Name.text + "  (missing)" : parts.Name.text;
             element.tooltip = missing ? "Not found: " + path + "\nRemove it with ×, or put the scene back."
                 : open ? path + "\n(open)" : path;
