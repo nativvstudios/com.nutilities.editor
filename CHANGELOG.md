@@ -5,6 +5,16 @@ All notable changes to nUtilities will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-19
+
+### Added
+- **nSelect**: right-click in the Scene view to list everything under the cursor, front to back, and pick one.
+  Sprites show their pictures; each tilemap layer's tile is its own entry (layer, tile and cell); objects that only
+  have a 2D collider or trigger there are listed too. Search by name or `t:Type`, filter tabs with counts, a Scene view
+  outline for the hovered entry, Ctrl/Shift-click to add to the selection, double-click to frame, Alt-click for the
+  tile or sprite asset. Right-clicking empty space still opens Unity's own menu. Settings in Preferences > nUtilities
+  > nSelect.
+
 ## [1.0.0] - 2024-01-01
 
 ### Added

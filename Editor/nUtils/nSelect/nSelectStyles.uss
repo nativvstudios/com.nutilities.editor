@@ -1,0 +1,153 @@
+/* nSelect's pick list. Colours from the editor theme, so it follows the user's skin. */
+
+.pick {
+    background-color: var(--unity-colors-window-background);
+    border-left-width: 1px;
+    border-right-width: 1px;
+    border-top-width: 1px;
+    border-bottom-width: 1px;
+    border-left-color: var(--unity-colors-default-border);
+    border-right-color: var(--unity-colors-default-border);
+    border-top-color: var(--unity-colors-default-border);
+    border-bottom-color: var(--unity-colors-default-border);
+    padding-left: 4px;
+    padding-right: 4px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+    flex-grow: 1;
+}
+
+.pick__search {
+    margin-left: 0;
+    margin-right: 0;
+    margin-bottom: 4px;
+    height: 24px;
+}
+
+.pick__tabs {
+    flex-direction: row;
+    flex-wrap: wrap;
+    margin-bottom: 4px;
+}
+
+.pick__tab {
+    height: 20px;
+    margin-left: 0;
+    margin-right: 3px;
+    margin-top: 0;
+    margin-bottom: 0;
+    padding-left: 7px;
+    padding-right: 7px;
+    border-radius: 10px;
+    font-size: 11px;
+}
+
+.pick__tab--on {
+    background-color: var(--unity-colors-highlight-background);
+    color: var(--unity-colors-highlight-text);
+}
+
+.pick__list {
+    flex-grow: 1;
+}
+
+.pick__row {
+    flex-direction: row;
+    align-items: center;
+    height: 38px;
+    padding-left: 4px;
+    padding-right: 6px;
+    border-left-width: 3px;
+    border-left-color: rgba(0, 0, 0, 0);
+}
+
+/* Already selected: an accent edge. */
+.pick__row--selected {
+    border-left-color: rgb(80, 160, 240);
+}
+
+.pick__picture {
+    width: 30px;
+    height: 30px;
+    flex-shrink: 0;
+    margin-right: 7px;
+    border-radius: 3px;
+    background-color: rgba(0, 0, 0, 0.22);
+}
+
+.pick__picture--icon {
+    padding-left: 6px;
+    padding-right: 6px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+}
+
+.pick__text {
+    flex-grow: 1;
+    flex-shrink: 1;
+    overflow: hidden;
+    justify-content: center;
+}
+
+.pick__name {
+    font-size: 12px;
+    -unity-font-style: bold;
+    color: var(--unity-colors-default-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pick__path {
+    font-size: 10px;
+    color: var(--unity-colors-input_field_placeholder-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pick__right {
+    flex-shrink: 0;
+    align-items: flex-end;
+    justify-content: center;
+    margin-left: 6px;
+}
+
+.pick__detail {
+    font-size: 10px;
+    color: var(--unity-colors-input_field_placeholder-text);
+    -unity-text-align: middle-right;
+}
+
+.pick__detail--tile {
+    color: rgb(130, 200, 120);
+}
+
+.pick__detail--collider {
+    color: rgb(230, 175, 80);
+}
+
+.pick__icons {
+    flex-direction: row;
+    margin-top: 2px;
+}
+
+.pick__icon {
+    width: 14px;
+    height: 14px;
+    margin-left: 2px;
+    opacity: 0.85;
+}
+
+.pick__empty {
+    display: none;
+    -unity-text-align: middle-center;
+    color: var(--unity-colors-input_field_placeholder-text);
+    margin-top: 10px;
+}
+
+.unity-collection-view__item--selected .pick__name,
+.unity-collection-view__item--selected .pick__path,
+.unity-collection-view__item--selected .pick__detail {
+    color: var(--unity-colors-highlight-text);
+}

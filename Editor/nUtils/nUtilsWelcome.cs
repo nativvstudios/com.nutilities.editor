@@ -111,6 +111,17 @@ public class WelcomeWindow : EditorWindow
             () => EditorApplication.ExecuteMenuItem("Window/nUtilities/Hierarchy Organizer Manager")
         );
 
+        GUILayout.Space(10);
+
+        DrawUtilityCard(
+            "nSelect",
+            "Pick anything under the cursor",
+            "Right-click in the Scene view to list everything there, front to back: sprites, the tile in each " +
+            "tilemap layer, colliders and triggers. Search, filter, hover to outline, click to select.",
+            new Color(0.95f, 0.75f, 0.3f),
+            () => EditorApplication.ExecuteMenuItem("Window/nUtilities/nSelect Settings")
+        );
+
         GUILayout.Space(15);
 
         // Support section

@@ -40,6 +40,15 @@ Create colored separators to organize your scene hierarchy.
 - **Menu:** Right-click in Hierarchy → `nUtilities > Hierarchy Organizer`
 - **Manager:** `Window > nUtilities > Hierarchy Organizer Manager`
 
+### 🎯 nSelect
+Pick anything under the cursor in the Scene view, even what's buried under other objects.
+- **Use:** Right-click in the Scene view (a right-drag still pans; empty space still opens Unity's own menu)
+- Lists everything there front to back: sprites with their pictures, the tile in each tilemap layer (layer, tile, cell),
+  objects that only have a 2D collider or trigger there, UI, and 3D renderers
+- Search by name or `t:Type`, filter tabs with counts, hover to outline it in the Scene view
+- Click to select, Ctrl/Shift-click to add, double-click to frame, Alt-click for the tile or sprite asset
+- **Settings:** `Window > nUtilities > nSelect Settings` (Preferences > nUtilities > nSelect)
+
 ## Requirements
 
 - Unity 2020.3 or higher

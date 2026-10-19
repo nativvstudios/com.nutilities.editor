@@ -1,8 +1,8 @@
 {
   "name": "com.nutilities.editor",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "displayName": "nUtilities",
-  "description": "A collection of Unity Editor utilities including nSearch, Scene Organizer, Favorites, and Hierarchy Organizer. Boost your productivity with fast fuzzy search, scene management, asset bookmarking, and visual hierarchy organization.",
+  "description": "A collection of Unity Editor utilities including nSearch, Scene Organizer, Favorites, Hierarchy Organizer and nSelect. Boost your productivity with fast fuzzy search, scene management, asset bookmarking, visual hierarchy organization, and picking anything under the cursor in the Scene view.",
   "unity": "2020.3",
   "unityRelease": "0f1",
   "keywords": [
@@ -14,7 +14,8 @@
     "organizer",
     "search",
     "hierarchy",
-    "productivity"
+    "productivity",
+    "selection"
   ],
   "author": {
     "name": "Nativv Studios",
@@ -29,6 +30,9 @@
   "licensesUrl": "https://github.com/nativvstudios/com.nutilities.editor/blob/main/LICENSE.md",
   "hideInEditor": false,
   "type": "tool",
-  "dependencies": {},
-  "_fingerprint": "8e122647f2e8d623b3a53c19e95fa5e772ba1986"
+  "dependencies": {
+    "com.unity.modules.physics2d": "1.0.0",
+    "com.unity.modules.tilemap": "1.0.0"
+  },
+  "_fingerprint": "0631223af55ed4cb82fd0a302244b2633583095a"
 }
